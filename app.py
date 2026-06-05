@@ -1,11 +1,14 @@
-#### Changes from app.py : 1 - Sell Quantity should be negative, 2 - Add Tagging Column (Momentum/Shaukat/Dhruv)
+#### Changes from app1.py : 1 - Sell Quantity should be negative, 2 - Add Tagging Column (Momentum/Shaukat/Dhruv)
+#### 3 - Add Second Output Sheet with Derived Portfolio Calculations (Units, Wt Avg Cost, Current Price, Market Value, Realised P&L, Unrealised P&L)
  
 import io
 import re
-from typing import Tuple
+from datetime import datetime
+from typing import Dict, Tuple
 
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 
 VALID_TRANSACTION_TYPES = {"BUY", "SELL"}
@@ -28,6 +31,20 @@ OUTPUT_COLUMNS = [
     "Orignal Pur Date",
     "Transaction Tagging"
 ]
+
+PORTFOLIO_COLUMNS = [
+    "Client UCC",
+    "Category",
+    "Company",
+    "Units",
+    "Wt Avg Cost",
+    "Current Price",
+    "Market Value",
+    "Realised P&L",
+    "Unrealised P&L",
+]
+
+ISIN_TICKER_MAPPING_FILE = "ISIN-TICKER-MAPPING.csv"
 
 
 def parse_monarch_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -237,6 +254,211 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
+def dataframes_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    return output.getvalue()
+
+
+def parse_amount_series(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.replace(",", "", regex=False)
+        .str.replace("\u20b9", "", regex=False)
+        .str.replace("Rs.", "", regex=False)
+        .str.replace("Rs", "", regex=False)
+        .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    )
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
+
+
+@st.cache_data(ttl=60 * 15)
+def get_current_prices(symbols: Tuple[str, ...]) -> Dict[str, float]:
+    clean_symbols = sorted({
+        str(symbol).strip().upper()
+        for symbol in symbols
+        if str(symbol).strip()
+    })
+    if not clean_symbols:
+        return {}
+
+    ticker_symbols = [f"{symbol}.NS" for symbol in clean_symbols]
+    prices = {symbol: float("nan") for symbol in clean_symbols}
+
+    try:
+        history = yf.download(
+            tickers=ticker_symbols,
+            period="1d",
+            group_by="ticker",
+            progress=False,
+            threads=True,
+            auto_adjust=False,
+        )
+        if len(ticker_symbols) == 1:
+            close_series = history["Close"].dropna()
+            if not close_series.empty:
+                prices[clean_symbols[0]] = float(close_series.iloc[-1])
+        else:
+            ticker_level = history.columns.get_level_values(0)
+            for symbol, ticker_symbol in zip(clean_symbols, ticker_symbols):
+                if ticker_symbol in ticker_level:
+                    close_series = history[ticker_symbol]["Close"].dropna()
+                    if not close_series.empty:
+                        prices[symbol] = float(close_series.iloc[-1])
+    except Exception:
+        pass
+
+    missing_symbols = [symbol for symbol, price in prices.items() if pd.isna(price)]
+    for symbol in missing_symbols:
+        ticker_symbol = f"{symbol}.NS"
+        ticker = yf.Ticker(ticker_symbol)
+
+        try:
+            fast_info_price = ticker.fast_info.get("last_price")
+            if fast_info_price is not None:
+                prices[symbol] = float(fast_info_price)
+                continue
+        except Exception:
+            pass
+
+        try:
+            history = ticker.history(period="1d")
+            if not history.empty:
+                close_series = history["Close"].dropna()
+                if not close_series.empty:
+                    prices[symbol] = float(close_series.iloc[-1])
+        except Exception:
+            pass
+
+    return prices
+
+
+def load_isin_symbol_map(mapping_path: str = ISIN_TICKER_MAPPING_FILE) -> Dict[str, str]:
+    mapping_df = pd.read_csv(mapping_path, dtype=str, keep_default_na=False)
+    required_columns = ["ISIN", "SYMBOL"]
+    missing_columns = [col for col in required_columns if col not in mapping_df.columns]
+    if missing_columns:
+        raise ValueError(f"ISIN ticker mapping file is missing columns: {', '.join(missing_columns)}")
+
+    mapping_df = mapping_df[required_columns].copy()
+    mapping_df["ISIN"] = mapping_df["ISIN"].astype(str).str.strip().str.upper()
+    mapping_df["SYMBOL"] = mapping_df["SYMBOL"].astype(str).str.strip().str.upper()
+    mapping_df = mapping_df[mapping_df["ISIN"].ne("") & mapping_df["SYMBOL"].ne("")]
+
+    return mapping_df.drop_duplicates(subset=["ISIN"], keep="last").set_index("ISIN")["SYMBOL"].to_dict()
+
+
+def build_portfolio_summary(
+    result_df: pd.DataFrame,
+    isin_symbol_map: Dict[str, str],
+    fetch_live_prices: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    if result_df.empty:
+        return pd.DataFrame(columns=PORTFOLIO_COLUMNS), pd.DataFrame(), "Not fetched"
+
+    working_df = result_df.copy()
+    working_df["Quantity Numeric"] = parse_amount_series(working_df["Quantity"])
+    working_df["Rate Numeric"] = parse_amount_series(working_df["Rate"])
+    working_df["Client UCC"] = working_df["UCC"].astype(str).str.strip()
+    working_df["Category"] = working_df["Transaction Tagging"].astype(str).str.strip()
+    working_df["Company"] = working_df["Security"].astype(str).str.strip()
+    working_df["ISIN Key"] = working_df["ISIN"].astype(str).str.strip().str.upper()
+    working_df["Transaction Type"] = working_df["Transaction Description"].astype(str).str.strip().str.upper()
+
+    working_df["Ticker Symbol"] = working_df["ISIN Key"].map(isin_symbol_map).fillna("")
+    price_diagnostics = []
+    unmapped_df = working_df[working_df["ISIN Key"].ne("") & working_df["Ticker Symbol"].eq("")]
+    if not unmapped_df.empty:
+        price_diagnostics.extend(
+            unmapped_df[["Client UCC", "Category", "Company", "ISIN Key"]]
+            .drop_duplicates()
+            .rename(columns={"ISIN Key": "ISIN"})
+            .assign(Symbol="", Issue="ISIN not found in ticker mapping")
+            .to_dict("records")
+        )
+
+    price_fetch_timestamp = "Not fetched"
+    price_by_symbol = {}
+    if fetch_live_prices:
+        symbols = tuple(working_df["Ticker Symbol"].dropna().unique())
+        price_by_symbol = get_current_prices(symbols)
+        price_fetch_timestamp = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+
+        missing_price_symbols = {
+            symbol for symbol, price in price_by_symbol.items()
+            if pd.isna(price)
+        }
+        missing_price_df = working_df[working_df["Ticker Symbol"].isin(missing_price_symbols)]
+        if not missing_price_df.empty:
+            price_diagnostics.extend(
+                missing_price_df[["Client UCC", "Category", "Company", "ISIN Key", "Ticker Symbol"]]
+                .drop_duplicates()
+                .rename(columns={"ISIN Key": "ISIN", "Ticker Symbol": "Symbol"})
+                .assign(Issue="Yahoo price not found")
+                .to_dict("records")
+            )
+
+    summary_rows = []
+    group_columns = ["Client UCC", "Category", "Company", "ISIN Key"]
+    for group_values, group_df in working_df.groupby(group_columns, dropna=False, sort=True):
+        buy_df = group_df[group_df["Transaction Type"].eq("BUY") & group_df["Quantity Numeric"].gt(0)]
+        sell_df = group_df[group_df["Transaction Type"].eq("SELL")]
+
+        total_buy_quantity = buy_df["Quantity Numeric"].sum()
+        wt_avg_cost = (
+            (buy_df["Quantity Numeric"] * buy_df["Rate Numeric"]).sum() / total_buy_quantity
+            if total_buy_quantity
+            else 0
+        )
+        units = group_df["Quantity Numeric"].sum()
+
+        group_symbols = group_df["Ticker Symbol"].dropna()
+        current_price = float("nan")
+        if not group_symbols.empty:
+            current_price = price_by_symbol.get(group_symbols.iloc[-1], float("nan"))
+
+        market_value = units * current_price if pd.notna(current_price) else float("nan")
+        realised_pnl = ((sell_df["Rate Numeric"] - wt_avg_cost) * sell_df["Quantity Numeric"].abs()).sum()
+        unrealised_pnl = (
+            (current_price - wt_avg_cost) * units
+            if pd.notna(current_price)
+            else float("nan")
+        )
+
+        summary_rows.append({
+            "Client UCC": group_values[0],
+            "Category": group_values[1],
+            "Company": group_values[2],
+            "Units": units,
+            "Wt Avg Cost": wt_avg_cost,
+            "Current Price": current_price,
+            "Market Value": market_value,
+            "Realised P&L": realised_pnl,
+            "Unrealised P&L": unrealised_pnl,
+        })
+
+    summary_df = pd.DataFrame(summary_rows, columns=PORTFOLIO_COLUMNS)
+    numeric_columns = [
+        "Units",
+        "Wt Avg Cost",
+        "Current Price",
+        "Market Value",
+        "Realised P&L",
+        "Unrealised P&L",
+    ]
+    summary_df[numeric_columns] = summary_df[numeric_columns].round(2)
+
+    diagnostics_df = pd.DataFrame(
+        price_diagnostics,
+        columns=["Client UCC", "Category", "Company", "ISIN", "Symbol", "Issue"],
+    )
+
+    return summary_df, diagnostics_df, price_fetch_timestamp
+
+
 def set_page_style() -> None:
     st.markdown(
         """
@@ -313,7 +535,7 @@ def set_page_style() -> None:
 def main() -> None:
     st.set_page_config(
         page_title="Monarch Transaction Parser",
-        page_icon="💼",
+        page_icon=":briefcase:",
         layout="wide",
     )
 
@@ -336,13 +558,24 @@ def main() -> None:
             type=["xlsx", "xls"],
             help="Upload the file with ISIN, Transaction, Date, and Transaction Tagging."
         )
+        fetch_live_prices = st.checkbox(
+            "Fetch live Yahoo prices",
+            value=True,
+            help="Turn this off to generate the reports without waiting for live market prices."
+        )
+        refresh_live_prices = st.button(
+            "Refresh / Update prices",
+            disabled=not fetch_live_prices,
+            help="Clear cached prices and fetch the latest Yahoo prices again."
+        )
         st.markdown(
             "---\n"
             "### How it works\n"
             "1. Upload the raw transaction CSV.\n"
             "2. Upload the transaction tagging Excel file.\n"
             "3. The parser extracts BUY/SELL rows and matches tags by date, ISIN, and transaction.\n"
-            "4. Download the cleaned report and skipped rows."
+            "4. The portfolio report can use live Yahoo prices when enabled.\n"
+            "5. Download CSV or Excel outputs."
         )
 
     if uploaded_file is None:
@@ -391,6 +624,30 @@ def main() -> None:
         st.error(str(exc))
         return
 
+    try:
+        isin_symbol_map = load_isin_symbol_map()
+    except Exception as exc:
+        st.error(f"Unable to read {ISIN_TICKER_MAPPING_FILE}: {exc}")
+        return
+
+    if fetch_live_prices and refresh_live_prices:
+        get_current_prices.clear()
+        st.info("Refreshing Yahoo prices and recalculating reports.")
+
+    if fetch_live_prices:
+        with st.spinner("Fetching live Yahoo prices..."):
+            portfolio_df, price_warnings_df, price_fetch_timestamp = build_portfolio_summary(
+                result_df,
+                isin_symbol_map,
+                fetch_live_prices=True,
+            )
+    else:
+        portfolio_df, price_warnings_df, price_fetch_timestamp = build_portfolio_summary(
+            result_df,
+            isin_symbol_map,
+            fetch_live_prices=False,
+        )
+
     total_rows = len(raw)
     valid_rows = len(result_df)
     skipped_rows = len(skipped_df)
@@ -417,6 +674,26 @@ def main() -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
     with st.container():
+        st.subheader("Portfolio derived calculations")
+        if fetch_live_prices:
+            st.caption(f"Last price fetched at: {price_fetch_timestamp}")
+        else:
+            st.info("Live price fetching is off. Current Price, Market Value, and Unrealised P&L will remain blank.")
+        st.markdown("<div class='dataframe-container'>", unsafe_allow_html=True)
+        st.dataframe(portfolio_df)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.container():
+        st.subheader("Price warnings")
+        if price_warnings_df.empty:
+            st.info("No unmapped ISINs or missing Yahoo prices found.")
+        else:
+            st.warning("Some securities need attention before live-price based values are complete.")
+            st.markdown("<div class='dataframe-container'>", unsafe_allow_html=True)
+            st.dataframe(price_warnings_df)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.container():
         st.subheader("Skipped rows")
         if skipped_df.empty:
             st.info("No skipped rows.")
@@ -426,11 +703,18 @@ def main() -> None:
             st.markdown("</div>", unsafe_allow_html=True)
 
     output_csv = dataframe_to_csv_bytes(result_df)
+    portfolio_csv = dataframe_to_csv_bytes(portfolio_df)
     skipped_csv = dataframe_to_csv_bytes(skipped_df)
+    all_results_excel = dataframes_to_excel_bytes({
+        "Parsed Report": result_df,
+        "Portfolio Calculations": portfolio_df,
+        "Price Warnings": price_warnings_df,
+        "Skipped Rows": skipped_df,
+    })
 
     st.markdown("---")
     st.subheader("Download results")
-    download_col1, download_col2 = st.columns(2)
+    download_col1, download_col2, download_col3, download_col4 = st.columns(4)
     with download_col1:
         st.download_button(
             "Download parsed report",
@@ -440,10 +724,24 @@ def main() -> None:
         )
     with download_col2:
         st.download_button(
+            "Download portfolio calculations",
+            data=portfolio_csv,
+            file_name="Portfolio_Derived_Calculations.csv",
+            mime="text/csv"
+        )
+    with download_col3:
+        st.download_button(
             "Download skipped rows",
             data=skipped_csv,
             file_name="Skipped_Rows.csv",
             mime="text/csv"
+        )
+    with download_col4:
+        st.download_button(
+            "Download Excel workbook",
+            data=all_results_excel,
+            file_name="Monarch_Reports.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
 
