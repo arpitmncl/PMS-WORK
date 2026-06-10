@@ -1,4 +1,5 @@
 #### Changes from app2.py : Change Realized P&L logic to direct take from Transaction Amount column
+####    Add ISIN column in Final Output File
 
 import io
 import re
@@ -35,6 +36,7 @@ PORTFOLIO_COLUMNS = [
     "Client UCC",
     "Category",
     "Company",
+    "ISIN",
     "Units",
     "Wt Avg Cost",
     "Current Price",
@@ -433,6 +435,7 @@ def build_portfolio_summary(
             "Client UCC": group_values[0],
             "Category": group_values[1],
             "Company": group_values[2],
+            "ISIN": group_values[3],
             "Units": units,
             "Wt Avg Cost": wt_avg_cost,
             "Current Price": current_price,
