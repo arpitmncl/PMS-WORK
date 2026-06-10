@@ -1,6 +1,5 @@
-#### Changes from app1.py : 1 - Sell Quantity should be negative, 2 - Add Tagging Column (Momentum/Shaukat/Dhruv)
-#### 3 - Add Second Output Sheet with Derived Portfolio Calculations (Units, Wt Avg Cost, Current Price, Market Value, Realised P&L, Unrealised P&L)
- 
+#### Changes from app2.py : Change Realized P&L logic to direct take from Transaction Amount column
+
 import io
 import re
 from datetime import datetime
@@ -362,6 +361,7 @@ def build_portfolio_summary(
     working_df = result_df.copy()
     working_df["Quantity Numeric"] = parse_amount_series(working_df["Quantity"])
     working_df["Rate Numeric"] = parse_amount_series(working_df["Rate"])
+    working_df["Tran Amount Numeric"] = parse_amount_series(working_df["Tran Amount"])
     working_df["Client UCC"] = working_df["UCC"].astype(str).str.strip()
     working_df["Category"] = working_df["Transaction Tagging"].astype(str).str.strip()
     working_df["Company"] = working_df["Security"].astype(str).str.strip()
@@ -421,7 +421,8 @@ def build_portfolio_summary(
             current_price = price_by_symbol.get(group_symbols.iloc[-1], float("nan"))
 
         market_value = units * current_price if pd.notna(current_price) else float("nan")
-        realised_pnl = ((sell_df["Rate Numeric"] - wt_avg_cost) * sell_df["Quantity Numeric"].abs()).sum()
+        sell_prices = sell_df["Tran Amount Numeric"] / sell_df["Quantity Numeric"].abs().replace({0: pd.NA})
+        realised_pnl = ((sell_prices.fillna(0) - wt_avg_cost) * sell_df["Quantity Numeric"].abs()).sum()
         unrealised_pnl = (
             (current_price - wt_avg_cost) * units
             if pd.notna(current_price)
