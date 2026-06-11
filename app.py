@@ -1,5 +1,6 @@
-#### Changes from app2.py : Change Realized P&L logic to direct take from Transaction Amount column
+#### Changes from app3.py : Change Realized P&L logic to direct take from Transaction Amount column
 ####    Add ISIN column in Final Output File
+####    Making 'Shares - Listed' row dynamic so that other names like 'Shares - Equity ETF' can also be accomodated
 
 import io
 import re
@@ -107,7 +108,7 @@ def parse_monarch_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
 
             for k in range(header_row, min(header_row + 15, n)):
                 value = str(raw.iloc[k, 0]).strip()
-                if value == "Shares - Listed":
+                if value.startswith("Shares - "):
                     shares_row = k
                     break
 
