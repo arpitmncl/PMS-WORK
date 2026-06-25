@@ -739,17 +739,27 @@ def main() -> None:
         st.subheader("Missing transaction tagging — provide tags")
         st.info("Select a tag for each row below to save it to the Supabase tagging table. Processing will continue after saving.")
         with st.form("tagging_form"):
+            # Header row
+            header_cols = st.columns([2, 2, 2, 2, 2])
+            header_cols[0].markdown("**ISIN**")
+            header_cols[1].markdown("**Date**")
+            header_cols[2].markdown("**Security**")
+            header_cols[3].markdown("**Transaction**")
+            header_cols[4].markdown("**Tag**")
+            
             selections = []
             for idx, row in missing_unique.iterrows():
-                cols = st.columns([2, 2, 3, 2])
-                cols[0].write(f"**ISIN**: {row.get('ISIN', '')}")
-                cols[1].write(f"**Date**: {row.get('Tran Date', '')}")
-                cols[2].write(f"**Transaction**: {row.get('Transaction Description', '')}")
-                sel = cols[3].selectbox(
+                cols = st.columns([2, 2, 2, 2, 2], vertical_alignment="center")
+                cols[0].write(row.get('ISIN', ''))
+                cols[1].write(row.get('Tran Date', ''))
+                cols[2].write(row.get('Security', ''))
+                cols[3].write(row.get('Transaction Description', ''))
+                sel = cols[4].selectbox(
                     "Tag",
-                    options=sorted(VALID_TRANSACTION_TAGS),
+                    options=["Select"] + sorted(VALID_TRANSACTION_TAGS),
                     index=0,
                     key=f"tag_select_{idx}",
+                    label_visibility="hidden",
                 )
                 selections.append((idx, row.get('ISIN', ''), row.get('Tran Date', ''), row.get('Transaction Description', ''), sel))
 
