@@ -1,4 +1,6 @@
-#### Changes from app4.py : Automate Tagging Using Supabase
+#### Changes from app6.py : New Logic For Client Wise Split in Case of Same Analyst, Same Stock, Same Date
+#### Changes from app7.py : Formatting of Page, Colors, Background (Frontend Changes)
+
 
 import io
 import re
@@ -191,22 +193,24 @@ def parse_monarch_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
     return df, pd.DataFrame(skipped_rows)
 
 
-def add_transaction_tagging(result_df: pd.DataFrame, tagging_raw: pd.DataFrame) -> pd.DataFrame:
+def _normalize_tagging_dataframe(tagging_raw: pd.DataFrame) -> pd.DataFrame:
     required_columns = ["ISIN", "Transaction", "Date", "Transaction Tagging"]
     missing_columns = [col for col in required_columns if col not in tagging_raw.columns]
     if missing_columns:
         raise ValueError(f"Tagging file is missing columns: {', '.join(missing_columns)}")
 
-    tagging_df = tagging_raw[required_columns].copy()
-    original_dates = tagging_df["Date"].copy()
-    for col in ["ISIN", "Transaction", "Transaction Tagging"]:
-        tagging_df[col] = tagging_df[col].astype(str).str.strip()
+    tagging_df = tagging_raw.copy()
+    for col in ["ISIN", "Transaction", "Transaction Tagging", "Security", "Client UCC", "Quantity", "Date"]:
+        if col in tagging_df.columns:
+            tagging_df[col] = tagging_df[col].astype(str).str.strip()
+        else:
+            tagging_df[col] = ""
 
-    parsed_dates = pd.to_datetime(original_dates, errors="coerce")
+    parsed_dates = pd.to_datetime(tagging_df["Date"], errors="coerce")
     missing_dates = parsed_dates.isna()
     if missing_dates.any():
         parsed_dates.loc[missing_dates] = pd.to_datetime(
-            original_dates.loc[missing_dates].astype(str).str.strip(),
+            tagging_df.loc[missing_dates, "Date"].astype(str).str.strip(),
             dayfirst=True,
             errors="coerce"
         )
@@ -214,8 +218,10 @@ def add_transaction_tagging(result_df: pd.DataFrame, tagging_raw: pd.DataFrame) 
     tagging_df["Tran Date"] = parsed_dates.dt.strftime("%d-%m-%Y")
     tagging_df["ISIN"] = tagging_df["ISIN"].str.upper()
     tagging_df["Transaction Description"] = tagging_df["Transaction"].str.upper()
-    # tagging_df["Tag Key"] = tagging_df["Transaction Tagging"].str.upper()
-    tagging_df["Tag Key"] = tagging_df["Transaction Tagging"]
+    tagging_df["Tag Key"] = tagging_df["Transaction Tagging"].astype(str).str.strip()
+    tagging_df["Client UCC"] = tagging_df["Client UCC"].astype(str).str.strip().str.upper()
+    tagging_df["Quantity Numeric"] = parse_amount_series(tagging_df["Quantity"])
+    tagging_df["Quantity Abs"] = tagging_df["Quantity Numeric"].abs()
 
     tagging_df = tagging_df[
         tagging_df["Tran Date"].notna()
@@ -224,34 +230,166 @@ def add_transaction_tagging(result_df: pd.DataFrame, tagging_raw: pd.DataFrame) 
         & tagging_df["Tag Key"].isin(VALID_TRANSACTION_TAGS)
     ]
 
-    tagging_lookup = tagging_df.drop_duplicates(
-        subset=["Tran Date", "ISIN", "Transaction Description"],
-        keep="last"
-    )[["Tran Date", "ISIN", "Transaction Description", "Transaction Tagging"]].rename(
-        columns={
-            "ISIN": "Tag Match ISIN",
-            "Transaction Description": "Tag Match Transaction Description",
-        }
-    )
+    return tagging_df
+
+
+def add_transaction_tagging(result_df: pd.DataFrame, tagging_raw: pd.DataFrame) -> pd.DataFrame:
+    tagging_df = _normalize_tagging_dataframe(tagging_raw)
 
     tagged_result = result_df.copy()
     tagged_result["Tag Match ISIN"] = tagged_result["ISIN"].astype(str).str.strip().str.upper()
     tagged_result["Tag Match Transaction Description"] = (
         tagged_result["Transaction Description"].astype(str).str.strip().str.upper()
     )
+    tagged_result["Tag Match Client UCC"] = tagged_result["UCC"].astype(str).str.strip().str.upper()
+    tagged_result["Tag Match Quantity Abs"] = parse_amount_series(tagged_result["Quantity"]).abs()
 
-    tagged_result = tagged_result.drop(columns=["Transaction Tagging"], errors="ignore")
+    exact_lookup = tagging_df.rename(
+        columns={
+            "ISIN": "Tag Match ISIN",
+            "Transaction Description": "Tag Match Transaction Description",
+            "Client UCC": "Tag Match Client UCC",
+            "Quantity Abs": "Tag Match Quantity Abs",
+            "Transaction Tagging": "Exact Transaction Tagging",
+        }
+    )[
+        [
+            "Tran Date",
+            "Tag Match ISIN",
+            "Tag Match Transaction Description",
+            "Tag Match Client UCC",
+            "Tag Match Quantity Abs",
+            "Exact Transaction Tagging",
+        ]
+    ].drop_duplicates(
+        subset=[
+            "Tran Date",
+            "Tag Match ISIN",
+            "Tag Match Transaction Description",
+            "Tag Match Client UCC",
+            "Tag Match Quantity Abs",
+        ],
+        keep="last"
+    )
+
     tagged_result = tagged_result.merge(
-        tagging_lookup,
+        exact_lookup,
         how="left",
-        on=["Tran Date", "Tag Match ISIN", "Tag Match Transaction Description"]
+        on=[
+            "Tran Date",
+            "Tag Match ISIN",
+            "Tag Match Transaction Description",
+            "Tag Match Client UCC",
+            "Tag Match Quantity Abs",
+        ],
     )
-    tagged_result["Transaction Tagging"] = tagged_result["Transaction Tagging"].fillna("")
+
+    grouped_tags = (
+        tagging_df.groupby(["Tran Date", "ISIN", "Transaction Description"], dropna=False)["Tag Key"]
+        .nunique()
+        .reset_index(name="TagCount")
+    )
+    single_tag_groups = grouped_tags[grouped_tags["TagCount"] == 1]
+    fallback_lookup = pd.merge(
+        single_tag_groups,
+        tagging_df[["Tran Date", "ISIN", "Transaction Description", "Tag Key"]].drop_duplicates(),
+        on=["Tran Date", "ISIN", "Transaction Description"],
+        how="left",
+    ).rename(columns={"Tag Key": "Fallback Transaction Tagging"})[
+        ["Tran Date", "ISIN", "Transaction Description", "Fallback Transaction Tagging"]
+    ]
+
+    tagged_result = tagged_result.merge(
+        fallback_lookup,
+        how="left",
+        left_on=["Tran Date", "Tag Match ISIN", "Tag Match Transaction Description"],
+        right_on=["Tran Date", "ISIN", "Transaction Description"],
+    )
+
+    tagged_result["Transaction Tagging"] = tagged_result["Exact Transaction Tagging"].fillna(
+        tagged_result["Fallback Transaction Tagging"]
+    ).fillna("")
+
     tagged_result = tagged_result.drop(
-        columns=["Tag Match ISIN", "Tag Match Transaction Description"]
+        columns=[
+            "Tag Match ISIN",
+            "Tag Match Transaction Description",
+            "Tag Match Client UCC",
+            "Tag Match Quantity Abs",
+            "Exact Transaction Tagging",
+            "Fallback Transaction Tagging",
+            "ISIN",
+            "Transaction Description",
+        ],
+        errors="ignore",
     )
+
+    tagged_result["ISIN"] = result_df["ISIN"].astype(str).str.strip()
+    tagged_result["Transaction Description"] = result_df["Transaction Description"].astype(str).str.strip()
 
     return tagged_result[OUTPUT_COLUMNS]
+
+
+def compute_transaction_quantity_mismatch(
+    result_df: pd.DataFrame,
+    tagging_raw: pd.DataFrame,
+) -> pd.DataFrame:
+    tagging_df = _normalize_tagging_dataframe(tagging_raw)
+    # Group parsed quantities and capture a representative Security value from result_df
+    result_grouped = (
+        result_df.assign(
+            Tran_Date=result_df["Tran Date"].astype(str).str.strip(),
+            ISIN_Key=result_df["ISIN"].astype(str).str.strip().str.upper(),
+            Transaction_Type=result_df["Transaction Description"].astype(str).str.strip().str.upper(),
+            Quantity_Abs=parse_amount_series(result_df["Quantity"]).abs(),
+            Security=result_df.get("Security", ""),
+        )
+        [["Tran_Date", "ISIN_Key", "Transaction_Type", "Quantity_Abs", "Security"]]
+        .groupby(["Tran_Date", "ISIN_Key", "Transaction_Type"], dropna=False)
+        .agg({"Quantity_Abs": "sum", "Security": "first"})
+        .reset_index()
+        .rename(
+            columns={
+                "Tran_Date": "Tran Date",
+                "ISIN_Key": "ISIN",
+                "Transaction_Type": "Transaction Description",
+                "Quantity_Abs": "Parsed Quantity",
+                "Security": "Security",
+            }
+        )
+    )
+
+    tagging_grouped = (
+        tagging_df.groupby(["Tran Date", "ISIN", "Transaction Description"], dropna=False)["Quantity Abs"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Quantity Abs": "Tagged Quantity"})
+    )
+
+    mismatch = pd.merge(
+        result_grouped,
+        tagging_grouped,
+        on=["Tran Date", "ISIN", "Transaction Description"],
+        how="outer",
+    ).fillna(0)
+    mismatch = mismatch[mismatch["Parsed Quantity"] != mismatch["Tagged Quantity"]].copy()
+    if mismatch.empty:
+        return mismatch
+
+    mismatch["Parsed Quantity"] = mismatch["Parsed Quantity"].astype(float)
+    mismatch["Tagged Quantity"] = mismatch["Tagged Quantity"].astype(float)
+    # Ensure Security appears before ISIN in summary
+    cols_order = [
+        "Tran Date",
+        "Security",
+        "ISIN",
+        "Transaction Description",
+        "Parsed Quantity",
+        "Tagged Quantity",
+    ]
+    existing_cols = [c for c in cols_order if c in mismatch.columns]
+    other_cols = [c for c in mismatch.columns if c not in existing_cols]
+    return mismatch[existing_cols + other_cols].sort_values(["Tran Date", "ISIN", "Transaction Description"]).reset_index(drop=True)
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -488,72 +626,762 @@ def build_portfolio_summary(
     return summary_df, diagnostics_df, price_fetch_timestamp
 
 
+def compute_running_avg_cost(transactions: pd.DataFrame) -> Tuple[float, float]:
+    avg_cost = 0.0
+    units = 0.0
+    realised_pnl = 0.0
+    ordered = transactions.sort_values(
+        by=["Tran Date Parsed"],
+        kind="mergesort",
+        na_position="last"
+    )
+
+    for _, row in ordered.iterrows():
+        quantity = row["Quantity Numeric"]
+        rate = row["Rate Numeric"]
+        transaction_type = row["Transaction Type"]
+
+        if transaction_type == "BUY" and quantity > 0:
+            total_cost = units * avg_cost + quantity * rate
+            units += quantity
+            avg_cost = total_cost / units if units else 0.0
+        elif transaction_type == "SELL" and quantity < 0:
+            sell_qty = abs(quantity)
+            realised_pnl += (rate - avg_cost) * sell_qty
+            units -= sell_qty
+            if units <= 0:
+                units = 0.0
+                avg_cost = 0.0
+
+    return avg_cost, realised_pnl
+
+
+@st.cache_data(ttl=60 * 15)
+def get_current_and_previous_prices(symbols: Tuple[str, ...]) -> Dict[str, Dict[str, float]]:
+    clean_symbols = sorted({
+        str(symbol).strip().upper()
+        for symbol in symbols
+        if str(symbol).strip()
+    })
+    if not clean_symbols:
+        return {}
+
+    price_map: Dict[str, Dict[str, float]] = {
+        symbol: {"Current Price": float("nan"), "Previous Close": float("nan")}
+        for symbol in clean_symbols
+    }
+
+    for symbol in clean_symbols:
+        ticker_symbol = f"{symbol}.NS"
+        ticker = yf.Ticker(ticker_symbol)
+
+        try:
+            fast_info = ticker.fast_info
+            fast_info_price = fast_info.get("last_price")
+            if fast_info_price is not None:
+                price_map[symbol]["Current Price"] = float(fast_info_price)
+
+            if pd.isna(price_map[symbol]["Previous Close"]):
+                previous_close = fast_info.get("previous_close")
+                if previous_close is not None:
+                    price_map[symbol]["Previous Close"] = float(previous_close)
+        except Exception:
+            pass
+
+        try:
+            history = ticker.history(period="5d", auto_adjust=False, actions=False)
+            if not history.empty:
+                close_series = history["Close"].dropna()
+                if not close_series.empty:
+                    if pd.isna(price_map[symbol]["Current Price"]):
+                        price_map[symbol]["Current Price"] = float(close_series.iloc[-1])
+                    if pd.isna(price_map[symbol]["Previous Close"]) and len(close_series) >= 2:
+                        price_map[symbol]["Previous Close"] = float(close_series.iloc[-2])
+        except Exception:
+            pass
+
+    return price_map
+
+
+def build_consolidated_summaries(
+    result_df: pd.DataFrame,
+    isin_symbol_map: Dict[str, str],
+    fetch_live_prices: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    if result_df.empty:
+        empty_df = pd.DataFrame(columns=[
+            "Company [Total Holdings: 0]",
+            "Units",
+            "Wt Avg Cost",
+            "Current Price",
+            "Previous Close",
+            "Market Value",
+            "Today's Change",
+            "Realised P&L",
+            "Unrealised P&L",
+        ])
+        return {"PMS Consolidated": empty_df}
+
+    working_df = result_df.copy()
+    working_df["Quantity Numeric"] = parse_amount_series(working_df["Quantity"])
+    working_df["Rate Numeric"] = parse_amount_series(working_df["Rate"])
+    working_df["Tran Amount Numeric"] = parse_amount_series(working_df["Tran Amount"])
+    working_df["Company"] = working_df["Security"].astype(str).str.strip()
+    working_df["ISIN Key"] = working_df["ISIN"].astype(str).str.strip().str.upper()
+    working_df["Transaction Type"] = working_df["Transaction Description"].astype(str).str.strip().str.upper()
+    working_df["Tran Date Parsed"] = pd.to_datetime(
+        working_df["Tran Date"], format="%d-%m-%Y", errors="coerce"
+    )
+    mapping_lookup = isin_symbol_map if isinstance(isin_symbol_map, dict) else dict(isin_symbol_map)
+    working_df["Ticker Symbol"] = working_df["ISIN Key"].map(mapping_lookup).fillna("")
+    working_df["Category"] = working_df["Transaction Tagging"].astype(str).str.strip()
+
+    price_lookup: Dict[str, Dict[str, float]] = {}
+    if fetch_live_prices:
+        symbols = tuple(working_df["Ticker Symbol"].dropna().unique())
+        price_lookup = get_current_and_previous_prices(symbols)
+
+    portfolio_df, _, _ = build_portfolio_summary(
+        result_df,
+        isin_symbol_map,
+        fetch_live_prices=fetch_live_prices,
+    )
+    portfolio_df = portfolio_df.copy()
+    portfolio_df["Company"] = portfolio_df["Company"].astype(str).str.strip()
+    portfolio_df["ISIN Key"] = portfolio_df["ISIN"].astype(str).str.strip().str.upper()
+    portfolio_df["Category"] = portfolio_df["Category"].astype(str).str.strip()
+
+    def get_price_metrics_for_group(group_company: str, group_isin: str) -> Tuple[float, float]:
+        matching_transactions = working_df[
+            (working_df["Company"].astype(str).str.strip() == group_company)
+            & (working_df["ISIN Key"].astype(str).str.strip().str.upper() == group_isin.upper())
+        ]
+        if matching_transactions.empty:
+            return float("nan"), float("nan")
+
+        symbol = matching_transactions["Ticker Symbol"].dropna().iloc[-1] if not matching_transactions["Ticker Symbol"].dropna().empty else ""
+        price_info = price_lookup.get(symbol, {}) if symbol else {}
+        current_price = price_info.get("Current Price", float("nan"))
+        previous_close = price_info.get("Previous Close", float("nan"))
+        return float(current_price), float(previous_close)
+
+    def compute_today_change_for_group(group_company: str, group_isin: str) -> float:
+        matching_transactions = working_df[
+            (working_df["Company"].astype(str).str.strip() == group_company)
+            & (working_df["ISIN Key"].astype(str).str.strip().str.upper() == group_isin.upper())
+        ]
+        if matching_transactions.empty:
+            return float("nan")
+
+        current_price, previous_close = get_price_metrics_for_group(group_company, group_isin)
+        if pd.isna(current_price) or pd.isna(previous_close):
+            return float("nan")
+
+        today = datetime.now().date()
+        today_mask = matching_transactions["Tran Date Parsed"].dt.normalize() == pd.Timestamp(today)
+        prior_mask = matching_transactions["Tran Date Parsed"].dt.normalize() < pd.Timestamp(today)
+        today_transactions = matching_transactions.loc[today_mask]
+        units_before_today = matching_transactions.loc[prior_mask]["Quantity Numeric"].sum()
+        if not today_transactions.empty:
+            today_change = units_before_today * (current_price - previous_close)
+            today_change += (
+                (today_transactions["Rate Numeric"] - previous_close) * today_transactions["Quantity Numeric"]
+            ).sum()
+        else:
+            today_change = matching_transactions["Quantity Numeric"].sum() * (current_price - previous_close)
+        return float(today_change)
+
+    def build_summary_df(group_df: pd.DataFrame, group_columns: list) -> pd.DataFrame:
+        summary_rows = []
+        for _, group_values in group_df.groupby(group_columns, dropna=False, sort=True):
+            group = group_df.loc[group_values.index]
+            units = float(group["Units"].sum())
+            weight = float((group["Units"] * group["Wt Avg Cost"]).sum()) if units else 0.0
+            wt_avg_cost = weight / units if units else 0.0
+            current_price = group["Current Price"].dropna().iloc[-1] if not group["Current Price"].dropna().empty else float("nan")
+            market_value = float(group["Market Value"].sum())
+            realised_pnl = float(group["Realised P&L"].sum())
+            unrealised_pnl = float(group["Unrealised P&L"].sum())
+            current_price, previous_close = get_price_metrics_for_group(
+                str(group["Company"].iloc[0]).strip(),
+                str(group["ISIN Key"].iloc[0]).strip(),
+            )
+            today_change = compute_today_change_for_group(
+                str(group["Company"].iloc[0]).strip(),
+                str(group["ISIN Key"].iloc[0]).strip(),
+            )
+
+            summary_rows.append({
+                "Company": str(group["Company"].iloc[0]).strip(),
+                "Units": units,
+                "Wt Avg Cost": wt_avg_cost,
+                "Current Price": current_price,
+                "Previous Close": previous_close,
+                "Market Value": market_value,
+                "Today's Change": today_change,
+                "Realised P&L": realised_pnl,
+                "Unrealised P&L": unrealised_pnl,
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+        if summary_df.empty:
+            first_column_name = "Company [Total Holdings: 0]"
+            return pd.DataFrame(columns=[
+                first_column_name,
+                "Units",
+                "Wt Avg Cost",
+                "Current Price",
+                "Previous Close",
+                "Market Value",
+                "Today's Change",
+                "Realised P&L",
+                "Unrealised P&L",
+            ])
+
+        first_column_name = f"Company [Total Holdings: {len(summary_df)}]"
+        summary_df = summary_df.rename(columns={"Company": first_column_name})
+        numeric_columns = [
+            "Units",
+            "Wt Avg Cost",
+            "Current Price",
+            "Previous Close",
+            "Market Value",
+            "Today's Change",
+            "Realised P&L",
+            "Unrealised P&L",
+        ]
+        summary_df[numeric_columns] = summary_df[numeric_columns].round(2)
+        return summary_df[[first_column_name] + numeric_columns]
+
+    summaries: Dict[str, pd.DataFrame] = {}
+    consolidated_df = build_summary_df(portfolio_df, ["Company", "ISIN Key"])
+    summaries["PMS Consolidated"] = consolidated_df
+
+    for analyst in sorted({value for value in working_df["Category"].dropna().unique() if str(value).strip()}):
+        analyst_df = portfolio_df[portfolio_df["Category"].eq(analyst)]
+        if analyst_df.empty:
+            continue
+        summaries[str(analyst)] = build_summary_df(analyst_df, ["Company", "ISIN Key"])
+
+    return summaries
+
+
 def set_page_style() -> None:
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap');
+
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --accent-teal: #14b8a6;
+            --accent-rose: #f43f5e;
+            --accent-amber: #f59e0b;
+            --accent-violet: #8b5cf6;
+            --text-primary: #1e1b4b;
+            --text-secondary: #475569;
+            --glass-bg: rgba(255, 255, 255, 0.72);
+            --glass-border: rgba(255, 255, 255, 0.55);
+            --shadow-soft: 0 8px 32px rgba(99, 102, 241, 0.12);
+            --shadow-card: 0 20px 60px rgba(79, 70, 229, 0.14);
+        }
+
+        html, body, [class*="css"] {
+            font-family: 'DM Sans', sans-serif !important;
+        }
+
         .stApp {
-            background: linear-gradient(180deg, #eef4ff 0%, #fff7f2 45%, #ffffff 100%);
-            color: #0f3a72;
+            background:
+                radial-gradient(ellipse 80% 60% at 10% 0%, rgba(99, 102, 241, 0.35) 0%, transparent 55%),
+                radial-gradient(ellipse 70% 55% at 90% 10%, rgba(20, 184, 166, 0.28) 0%, transparent 50%),
+                radial-gradient(ellipse 60% 50% at 50% 100%, rgba(244, 63, 94, 0.18) 0%, transparent 55%),
+                radial-gradient(ellipse 50% 40% at 75% 60%, rgba(139, 92, 246, 0.22) 0%, transparent 50%),
+                linear-gradient(160deg, #ede9fe 0%, #e0f2fe 30%, #fdf4ff 65%, #fff7ed 100%);
+            color: var(--text-primary);
         }
 
         .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
-            background: rgba(255, 255, 255, 0.88);
-            box-shadow: 0 24px 80px rgba(17, 85, 204, 0.08);
-            border-radius: 24px;
+            padding-top: 1.5rem;
+            padding-bottom: 2.5rem;
+            max-width: 1200px;
         }
 
-        .streamlit-expanderHeader {
+        /* ── Sidebar (light theme, bold readable text) ── */
+        [data-testid="stSidebar"],
+        [data-testid="stSidebar"] > div:first-child {
+            background: linear-gradient(180deg, #f0f4ff 0%, #e8eeff 50%, #f5f3ff 100%) !important;
+            border-right: 1px solid rgba(99, 102, 241, 0.18);
+        }
+
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] li,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] ol,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] ul {
+            color: #1e293b !important;
+            font-weight: 500 !important;
+            line-height: 1.55 !important;
+        }
+
+        [data-testid="stSidebar"] .stMarkdown h1,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h1,
+        [data-testid="stSidebar"] [data-testid="stHeadingWithActionElements"] h1,
+        [data-testid="stSidebar"] [data-testid="stHeadingWithActionElements"] h2 {
+            color: #1e1b4b !important;
+            font-weight: 800 !important;
+            font-size: 1.35rem !important;
+            letter-spacing: -0.01em;
+        }
+
+        [data-testid="stSidebar"] .stMarkdown h2,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2 {
+            color: #312e81 !important;
+            font-weight: 800 !important;
+        }
+
+        [data-testid="stSidebar"] .stMarkdown h3,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3 {
+            color: #3730a3 !important;
+            font-weight: 700 !important;
+        }
+
+        [data-testid="stSidebar"] .stMarkdown h4,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h4 {
+            color: #4338ca !important;
+            font-weight: 700 !important;
+            font-size: 1rem !important;
+            margin-top: 0.6rem !important;
+        }
+
+        [data-testid="stSidebar"] .stCaption,
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+            color: #334155 !important;
+            font-weight: 600 !important;
+            font-size: 0.88rem !important;
+            line-height: 1.5 !important;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+        [data-testid="stSidebar"] label[data-testid="stWidgetLabel"] p,
+        [data-testid="stSidebar"] label[data-testid="stWidgetLabel"] {
+            color: #1e293b !important;
+            font-weight: 700 !important;
+            font-size: 0.92rem !important;
+        }
+
+        [data-testid="stSidebar"] hr {
+            border: none !important;
+            height: 1px !important;
+            background: linear-gradient(90deg, transparent, rgba(99,102,241,0.35), transparent) !important;
+            margin: 1rem 0 !important;
+        }
+
+        /* File uploader */
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] {
+            background: #f8faff !important;
+            border-radius: 14px;
+            padding: 0.75rem;
+            border: 1px solid #dbeafe;
+            box-shadow: 0 2px 10px rgba(99, 102, 241, 0.06);
+        }
+
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] label,
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] p,
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] span,
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] small,
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] [data-testid="stMarkdownContainer"] * {
+            color: #1e1b4b !important;
+            font-weight: 700 !important;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] button {
+            background: #e8eeff !important;
+            color: #312e81 !important;
+            border: 1px solid #c7d2fe !important;
+            border-radius: 10px !important;
+            font-weight: 800 !important;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] button:hover {
+            background: #dbeafe !important;
+            color: #1e1b4b !important;
+            border-color: #a5b4fc !important;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] section {
+            background: #ffffff !important;
+            border: 2px dashed #c7d2fe !important;
+            border-radius: 10px !important;
+        }
+
+        [data-testid="stSidebar"] [data-testid="stFileUploader"] section * {
+            color: #334155 !important;
+            font-weight: 700 !important;
+        }
+
+        /* Checkbox */
+        [data-testid="stSidebar"] .stCheckbox label span,
+        [data-testid="stSidebar"] .stCheckbox label[data-testid="stWidgetLabel"] p {
+            color: #1e293b !important;
+            font-weight: 700 !important;
+        }
+
+        /* Sidebar buttons */
+        [data-testid="stSidebar"] .stButton > button {
+            background: linear-gradient(135deg, #0d9488, #14b8a6) !important;
+            color: #ffffff !important;
+            border: none !important;
+            border-radius: 12px !important;
+            font-weight: 700 !important;
+            box-shadow: 0 4px 16px rgba(13, 148, 136, 0.35) !important;
+            transition: transform 0.2s, box-shadow 0.2s !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button p,
+        [data-testid="stSidebar"] .stButton > button span,
+        [data-testid="stSidebar"] .stButton > button div {
+            color: #ffffff !important;
+            font-weight: 700 !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:hover {
+            transform: translateY(-2px) !important;
+            box-shadow: 0 8px 24px rgba(13, 148, 136, 0.45) !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:disabled,
+        [data-testid="stSidebar"] .stButton > button[disabled] {
+            background: #cbd5e1 !important;
+            color: #64748b !important;
+            box-shadow: none !important;
+            opacity: 1 !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:disabled p,
+        [data-testid="stSidebar"] .stButton > button:disabled span,
+        [data-testid="stSidebar"] .stButton > button[disabled] p,
+        [data-testid="stSidebar"] .stButton > button[disabled] span {
+            color: #64748b !important;
+            font-weight: 700 !important;
+        }
+
+        .sidebar-brand {
+            text-align: center;
+            padding: 0.9rem 0.6rem 1rem;
+            background: linear-gradient(135deg, #eef2ff 0%, #f5f3ff 100%);
+            border-radius: 16px;
+            border: 1px solid #dbeafe;
+            margin-bottom: 1.2rem;
+            box-shadow: 0 2px 12px rgba(99, 102, 241, 0.08);
+        }
+
+        .sidebar-brand .brand-icon {
+            font-size: 2.2rem;
+            display: block;
+            margin-bottom: 0.2rem;
+        }
+
+        .sidebar-brand h3 {
+            margin: 0;
+            font-size: 1.05rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #312e81 !important;
+            font-weight: 800 !important;
+        }
+
+        /* ── Hero ── */
+        .hero-banner {
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(135deg, #4f46e5 0%, #6366f1 35%, #818cf8 65%, #14b8a6 100%);
+            border-radius: 28px;
+            padding: 2.4rem 2.8rem;
+            margin-bottom: 2rem;
+            box-shadow: var(--shadow-card);
+        }
+
+        .hero-banner::before {
+            content: '';
+            position: absolute;
+            top: -40%;
+            right: -10%;
+            width: 340px;
+            height: 340px;
+            background: rgba(255, 255, 255, 0.12);
+            border-radius: 50%;
+            pointer-events: none;
+        }
+
+        .hero-banner::after {
+            content: '';
+            position: absolute;
+            bottom: -50%;
+            left: 5%;
+            width: 260px;
+            height: 260px;
+            background: rgba(20, 184, 166, 0.25);
+            border-radius: 50%;
+            pointer-events: none;
+        }
+
+        .hero-banner h1 {
+            position: relative;
+            z-index: 1;
+            color: #ffffff !important;
+            font-size: 2.1rem;
+            font-weight: 700;
+            margin: 0 0 0.5rem 0;
+            letter-spacing: -0.02em;
+        }
+
+        .hero-banner p {
+            position: relative;
+            z-index: 1;
+            color: rgba(255, 255, 255, 0.88) !important;
+            font-size: 1.05rem;
+            margin: 0;
+            max-width: 620px;
+        }
+
+        .hero-badge {
+            position: relative;
+            z-index: 1;
+            display: inline-block;
+            background: rgba(255, 255, 255, 0.2);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            border-radius: 999px;
+            padding: 0.35rem 1rem;
+            font-size: 0.78rem;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: #ffffff;
+            margin-bottom: 0.9rem;
+        }
+
+        /* ── Welcome / empty state ── */
+        .welcome-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1.2rem;
+            margin-top: 1.5rem;
+        }
+
+        @media (max-width: 768px) {
+            .welcome-grid { grid-template-columns: 1fr; }
+        }
+
+        .welcome-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
+            padding: 1.5rem;
+            text-align: center;
+            box-shadow: var(--shadow-soft);
+            transition: transform 0.25s, box-shadow 0.25s;
+        }
+
+        .welcome-card:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-card);
+        }
+
+        .welcome-card .wc-icon {
+            font-size: 2rem;
+            margin-bottom: 0.6rem;
+        }
+
+        .welcome-card h4 {
+            color: var(--text-primary);
+            margin: 0 0 0.4rem;
+            font-size: 1rem;
             font-weight: 700;
         }
 
-        .stDownloadButton>button, .stButton>button {
-            border-radius: 14px;
-            background-color: #1f77d0;
-            color: white;
-            border: none;
-            padding: 0.9rem 1.4rem;
-            box-shadow: 0 10px 25px rgba(31, 119, 208, 0.2);
+        .welcome-card p {
+            color: var(--text-secondary);
+            margin: 0;
+            font-size: 0.88rem;
+            line-height: 1.5;
         }
 
-        .stDownloadButton>button:hover, .stButton>button:hover {
-            background-color: #145b98;
-        }
-
-        .stMetric {
-            border: 1px solid rgba(31, 119, 208, 0.16);
-            border-radius: 20px;
-            padding: 1rem;
-            background: linear-gradient(135deg, rgba(31, 119, 208, 0.08), rgba(255, 255, 255, 0.8));
-        }
-
-        .dataframe-container {
-            border-radius: 22px;
-            padding: 1rem;
-            background: #ffffff;
-            box-shadow: 0 22px 45px rgba(31, 119, 208, 0.08);
-        }
-
-        .hero-banner {
-            background: linear-gradient(90deg, #4d8bf5 0%, #89dff0 100%);
+        /* ── Section cards ── */
+        .section-card {
             border-radius: 24px;
-            padding: 1.6rem 2rem;
-            color: white;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 24px 50px rgba(77, 139, 245, 0.24);
+            background: var(--glass-bg);
+            backdrop-filter: blur(18px);
+            border: 1px solid var(--glass-border);
+            padding: 1.4rem 1.6rem;
+            margin-bottom: 1.6rem;
+            box-shadow: var(--shadow-soft);
         }
 
-        .hero-banner h1,
-        .hero-banner h2,
-        .hero-banner p {
-            color: white;
+        .section-header {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.12), rgba(139, 92, 246, 0.08));
+            border-left: 5px solid var(--primary);
+            border-radius: 14px;
+            padding: 0.75rem 1.1rem;
+            margin-bottom: 1.1rem;
+            color: var(--text-primary);
+            font-size: 1.12rem;
+            font-weight: 700;
         }
 
-        .sidebar .stButton>button,
-        .sidebar .stDownloadButton>button {
+        .section-header .sh-icon {
+            font-size: 1.3rem;
+        }
+
+        /* ── Metric cards ── */
+        .metrics-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+        }
+
+        @media (max-width: 900px) {
+            .metrics-row { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        .metric-card {
+            border-radius: 20px;
+            padding: 1.2rem 1.4rem;
+            color: #ffffff;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.12);
+            transition: transform 0.2s;
+        }
+
+        .metric-card:hover {
+            transform: translateY(-3px);
+        }
+
+        .metric-card .mc-label {
+            font-size: 0.78rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            opacity: 0.88;
+            margin-bottom: 0.3rem;
+        }
+
+        .metric-card .mc-value {
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1.1;
+        }
+
+        .metric-card.mc-blue   { background: linear-gradient(135deg, #4f46e5, #6366f1); }
+        .metric-card.mc-teal   { background: linear-gradient(135deg, #0d9488, #14b8a6); }
+        .metric-card.mc-violet { background: linear-gradient(135deg, #7c3aed, #8b5cf6); }
+        .metric-card.mc-rose   { background: linear-gradient(135deg, #e11d48, #f43f5e); }
+
+        /* ── Dataframes ── */
+        .dataframe-container {
+            border-radius: 18px;
+            padding: 0.5rem;
+            background: rgba(255, 255, 255, 0.85);
+            border: 1px solid rgba(99, 102, 241, 0.1);
+        }
+
+        [data-testid="stDataFrame"] {
+            border-radius: 14px;
+            overflow: hidden;
+        }
+
+        /* ── Alerts ── */
+        [data-testid="stAlert"] {
+            border-radius: 16px !important;
+        }
+
+        div[data-baseweb="notification"] {
+            border-radius: 16px !important;
+        }
+
+        /* ── Buttons ── */
+        .stDownloadButton > button,
+        .stButton > button {
+            border-radius: 14px !important;
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark)) !important;
+            color: white !important;
+            border: none !important;
+            padding: 0.75rem 1.2rem !important;
+            font-weight: 600 !important;
+            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.35) !important;
+            transition: transform 0.2s, box-shadow 0.2s !important;
+        }
+
+        .stDownloadButton > button:hover,
+        .stButton > button:hover {
+            transform: translateY(-2px) !important;
+            box-shadow: 0 10px 28px rgba(99, 102, 241, 0.5) !important;
+        }
+
+        .download-section .stDownloadButton > button {
+            background: linear-gradient(135deg, #7c3aed, #6366f1) !important;
             width: 100%;
+        }
+
+        /* ── Expanders ── */
+        [data-testid="stExpander"] {
+            background: rgba(255, 255, 255, 0.6);
+            border: 1px solid rgba(99, 102, 241, 0.15);
+            border-radius: 16px !important;
+            margin-bottom: 0.6rem;
+        }
+
+        [data-testid="stExpander"] summary {
+            font-weight: 700 !important;
+            color: var(--text-primary) !important;
+        }
+
+        /* ── Tagging form ── */
+        .tagging-banner {
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.15), rgba(244, 63, 94, 0.1));
+            border: 1px solid rgba(245, 158, 11, 0.35);
+            border-radius: 20px;
+            padding: 1.2rem 1.6rem;
+            margin-bottom: 1.2rem;
+        }
+
+        .tagging-banner h3 {
+            color: #92400e;
+            margin: 0 0 0.3rem;
+            font-size: 1.15rem;
+        }
+
+        .tagging-banner p {
+            color: #78350f;
+            margin: 0;
+            font-size: 0.92rem;
+        }
+
+        /* ── Footer ── */
+        .app-footer {
+            text-align: center;
+            padding: 1.5rem 0 0.5rem;
+            color: var(--text-secondary);
+            font-size: 0.82rem;
+            opacity: 0.7;
+        }
+
+        /* ── Divider ── */
+        hr {
+            border: none;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(99,102,241,0.3), transparent);
+            margin: 1.8rem 0;
+        }
+
+        /* Hide default Streamlit header/footer chrome */
+        #MainMenu { visibility: hidden; }
+        footer { visibility: hidden; }
+        header[data-testid="stHeader"] {
+            background: transparent !important;
         }
         </style>
         """,
@@ -564,18 +1392,34 @@ def set_page_style() -> None:
 def main() -> None:
     st.set_page_config(
         page_title="Monarch Transaction Parser",
-        page_icon=":briefcase:",
+        page_icon="📊",
         layout="wide",
     )
 
     set_page_style()
 
     st.markdown(
-        "<div class='hero-banner'><h1>Monarch Transaction Report Generator</h1><p>Upload your monarch transaction export and download a clean report with parsed buy/sell records.</p></div>",
+        """
+        <div class='hero-banner'>
+            <div class='hero-badge'>Portfolio Management System</div>
+            <h1>Monarch Transaction Report Generator</h1>
+            <p>Upload your Monarch transaction export to parse buy/sell records,
+               match analyst tags, and generate portfolio reports with live market prices.</p>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
     with st.sidebar:
+        st.markdown(
+            """
+            <div class='sidebar-brand'>
+                <span class='brand-icon'>📊</span>
+                <h3>Monarch PMS</h3>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.header("Upload & Download")
         uploaded_file = st.file_uploader(
             "Upload input CSV file",
@@ -605,7 +1449,38 @@ def main() -> None:
         )
 
     if uploaded_file is None:
-        st.info("Please upload a CSV file from the sidebar to generate the report.")
+        st.markdown(
+            """
+            <div class='section-card'>
+                <div class='section-header'><span class='sh-icon'>👋</span> Get started</div>
+                <p style='color:#475569; margin:0 0 0.5rem;'>
+                    Upload a Monarch transaction CSV from the sidebar to begin processing.
+                </p>
+                <div class='welcome-grid'>
+                    <div class='welcome-card'>
+                        <div class='wc-icon'>📁</div>
+                        <h4>Upload CSV</h4>
+                        <p>Drop your raw Monarch export file in the sidebar uploader.</p>
+                    </div>
+                    <div class='welcome-card'>
+                        <div class='wc-icon'>🏷️</div>
+                        <h4>Auto Tagging</h4>
+                        <p>Transaction tags are matched automatically from Supabase.</p>
+                    </div>
+                    <div class='welcome-card'>
+                        <div class='wc-icon'>📈</div>
+                        <h4>Live Prices</h4>
+                        <p>Portfolio values update with real-time Yahoo Finance prices.</p>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<div class='app-footer'>Monarch PMS · Transaction Report Generator</div>",
+            unsafe_allow_html=True,
+        )
         return
 
     # Load tagging data from Supabase (credentials from .env)
@@ -651,7 +1526,7 @@ def main() -> None:
     env = read_env_file(os.path.join(os.getcwd(), ".env"))
     supabase_url = env.get("SUPABASE_URL")
     supabase_key = env.get("SUPABASE_KEY")
-    table_name = env.get("TABLE_NAME")
+    table_name = env.get("TABLE_NAME_2")
 
     try:
         raw = pd.read_csv(
@@ -709,7 +1584,18 @@ def main() -> None:
         except Exception:
             return ""
 
-    def insert_tagging_to_supabase(supabase_url: str, supabase_key: str, table_name: str, isin: str, date_iso: str, transaction: str, tagging: str) -> None:
+    def insert_tagging_to_supabase(
+        supabase_url: str,
+        supabase_key: str,
+        table_name: str,
+        isin: str,
+        date_iso: str,
+        transaction: str,
+        security: str,
+        client_ucc: str,
+        quantity: int,
+        tagging: str,
+    ) -> None:
         if not supabase_url or not supabase_key or not table_name:
             raise ValueError("Supabase credentials/table missing")
         base = supabase_url.rstrip("/")
@@ -725,80 +1611,285 @@ def main() -> None:
             "ISIN": isin,
             "Date": date_iso,
             "Transaction": transaction,
+            "Security": security,
+            "Client UCC": client_ucc,
+            "Quantity": int(quantity),
             "Transaction Tagging": tagging,
         }
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
 
-    missing_mask = result_df["Transaction Tagging"].astype(str).str.strip() == ""
-    missing_df = result_df[missing_mask].copy()
+    def build_pending_tagging_rows(result_df: pd.DataFrame, tagging_raw: pd.DataFrame) -> pd.DataFrame:
+        mismatch_df = compute_transaction_quantity_mismatch(result_df, tagging_raw)
+        mismatch_keys = set(
+            tuple(x)
+            for x in mismatch_df[["Tran Date", "ISIN", "Transaction Description"]].values.tolist()
+        )
+
+        pending = result_df.copy()
+        pending["Tran Date"] = pending["Tran Date"].astype(str).str.strip()
+        pending["ISIN"] = pending["ISIN"].astype(str).str.strip().str.upper()
+        pending["Transaction Description"] = pending["Transaction Description"].astype(str).str.strip().str.upper()
+        pending["Quantity"] = pending["Quantity"].astype(str).str.strip()
+        pending["Client UCC"] = pending["UCC"].astype(str).str.strip().str.upper()
+
+        pending["Pending Tag"] = pending["Transaction Tagging"].astype(str).str.strip() == ""
+        pending["Group Mismatch"] = pending.apply(
+            lambda row: (row["Tran Date"], row["ISIN"], row["Transaction Description"]) in mismatch_keys,
+            axis=1,
+        )
+
+        return pending[pending["Pending Tag"] | pending["Group Mismatch"]].copy()
+
+    missing_df = build_pending_tagging_rows(result_df, tagging_raw)
     tags_saved = st.session_state.get("tags_saved", False)
 
     if not missing_df.empty and not tags_saved:
-        missing_unique = missing_df.drop_duplicates(subset=["Tran Date", "ISIN", "Transaction Description"])
-        st.subheader("Missing transaction tagging — provide tags")
-        st.info("Select a tag for each row below to save it to the Supabase tagging table. Processing will continue after saving.")
-        with st.form("tagging_form"):
-            # Header row
-            header_cols = st.columns([2, 2, 2, 2, 2])
-            header_cols[0].markdown("**ISIN**")
-            header_cols[1].markdown("**Date**")
-            header_cols[2].markdown("**Security**")
-            header_cols[3].markdown("**Transaction**")
-            header_cols[4].markdown("**Tag**")
-            
-            selections = []
-            for idx, row in missing_unique.iterrows():
-                cols = st.columns([2, 2, 2, 2, 2], vertical_alignment="center")
-                cols[0].write(row.get('ISIN', ''))
-                cols[1].write(row.get('Tran Date', ''))
-                cols[2].write(row.get('Security', ''))
-                cols[3].write(row.get('Transaction Description', ''))
-                sel = cols[4].selectbox(
-                    "Tag",
-                    options=["Select"] + sorted(VALID_TRANSACTION_TAGS),
-                    index=0,
-                    key=f"tag_select_{idx}",
-                    label_visibility="hidden",
+            st.markdown(
+                """
+                <div class='tagging-banner'>
+                    <h3>⚠️ Missing or mismatched transaction tagging</h3>
+                    <p>Some rows need analyst tags before the report can be generated.
+                       Enter tags below and save them to the database.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.info(
+                "Either some rows are untagged, or the client-based quantities for a date/stock/transaction do not tally with Supabase data. "
+                "Enter tags for each pending row below and save them to the tagging table."
+            )
+
+            mismatch_summary = compute_transaction_quantity_mismatch(result_df, tagging_raw)
+            if not mismatch_summary.empty:
+                st.warning("Quantity mismatch detected for the following date/stock/transaction groups:")
+                st.dataframe(mismatch_summary)
+
+            missing_unique = missing_df.drop_duplicates(
+                subset=["Tran Date", "ISIN", "Transaction Description", "Client UCC", "Quantity"]
+            )
+
+            grouping_columns = ["Tran Date", "ISIN", "Transaction Description"]
+            grouped_missing_rows = []
+            for group_idx, (group_key, group_df) in enumerate(
+                missing_unique.groupby(grouping_columns, sort=False)
+            ):
+                group_rows = group_df.reset_index(drop=True)
+                grouped_missing_rows.append(
+                    {
+                        "group_idx": group_idx,
+                        "tran_date": group_key[0],
+                        "isin": group_key[1],
+                        "transaction_desc": group_key[2],
+                        "security": group_rows["Security"].iloc[0] if not group_rows["Security"].empty else "",
+                        "rows": group_rows.to_dict("records"),
+                    }
                 )
-                selections.append((idx, row.get('ISIN', ''), row.get('Tran Date', ''), row.get('Transaction Description', ''), sel))
 
-            submit = st.form_submit_button("Save tags to Database")
+            form_group_choices = []
+            row_selections = []
 
-        if submit:
-            any_failed = False
-            for _idx, isin, tran_date_str, transaction_desc, sel in selections:
-                date_iso = parse_date_to_iso(tran_date_str)
-                try:
-                    insert_tagging_to_supabase(supabase_url, supabase_key, table_name, isin, date_iso, transaction_desc, sel)
-                    # update result_df in memory
-                    mask = (
-                        result_df["ISIN"].astype(str).str.strip().str.upper() == str(isin).strip().upper()
-                    ) & (
-                        result_df["Tran Date"].astype(str).str.strip() == str(tran_date_str).strip()
-                    ) & (
-                        result_df["Transaction Description"].astype(str).str.strip().str.upper() == str(transaction_desc).strip().upper()
+            for group in grouped_missing_rows:
+                st.markdown(
+                    f"#### {group['isin']} — {group['tran_date']} — {group['transaction_desc']}"
+                )
+                st.write(f"**Security:** {group['security']}")
+
+                split_choice = st.radio(
+                    "Stock tagging mode",
+                    options=["Split", "Don't Split"],
+                    index=1,
+                    key=f"group_mode_{group['group_idx']}",
+                )
+
+                if split_choice == "Don't Split":
+                    tag_choice = st.selectbox(
+                        "Assign analyst for this stock",
+                        options=["Select"] + sorted(VALID_TRANSACTION_TAGS),
+                        index=0,
+                        key=f"group_tag_{group['group_idx']}",
+                        label_visibility="collapsed",
                     )
-                    result_df.loc[mask, "Transaction Tagging"] = sel
-                except Exception as exc:
-                    any_failed = True
-                    st.error(f"Failed to save tag for {isin} {tran_date_str} {transaction_desc}: {exc}")
+                    form_group_choices.append(
+                        {
+                            "group": group,
+                            "mode": split_choice,
+                            "tag": tag_choice,
+                        }
+                    )
+                    st.markdown("**All clients and quantities for this stock will be tagged with the selected analyst.**")
+                    continue
 
-            if not any_failed:
-                st.session_state["tags_saved"] = True
-                st.success("All tags saved to Supabase and report updated. Processing will continue now.")
-                # refresh tagging_raw from Supabase so future runs will pick it up
-                try:
-                    tagging_raw = fetch_tagging_from_supabase(supabase_url, supabase_key, table_name)
-                    tagging_raw = tagging_raw.astype(str).fillna("")
-                    tagging_raw.columns = tagging_raw.columns.astype(str).str.strip()
-                except Exception:
-                    pass
-                # Rerun so the rest of the processing continues with updated tags
-                st.rerun()
+                header_cols = st.columns([2, 2, 2, 2, 2, 2])
+                header_cols[0].markdown("**ISIN**")
+                header_cols[1].markdown("**Date**")
+                header_cols[2].markdown("**Security**")
+                header_cols[3].markdown("**Client UCC**")
+                header_cols[4].markdown("**Quantity**")
+                header_cols[5].markdown("**Tag**")
 
-        # Stop here until the user saves tags to Supabase.
-        return
+                for row_idx, row in enumerate(group["rows"]):
+                    cols = st.columns([2, 2, 2, 2, 2, 2], vertical_alignment="center")
+                    cols[0].write(row.get("ISIN", ""))
+                    cols[1].write(row.get("Tran Date", ""))
+                    cols[2].write(row.get("Security", ""))
+                    cols[3].write(row.get("Client UCC", ""))
+                    cols[4].write(row.get("Quantity", ""))
+                    sel = cols[5].selectbox(
+                        f"Tag for {row.get('Client UCC', '')}",
+                        options=["Select"] + sorted(VALID_TRANSACTION_TAGS),
+                        index=0,
+                        key=f"tag_select_{group['group_idx']}_{row_idx}",
+                        label_visibility="visible",
+                    )
+                    row_selections.append(
+                        {
+                            "group": group,
+                            "isin": row.get("ISIN", ""),
+                            "tran_date": row.get("Tran Date", ""),
+                            "security": row.get("Security", ""),
+                            "client_ucc": row.get("Client UCC", ""),
+                            "quantity": row.get("Quantity", ""),
+                            "transaction_desc": row.get("Transaction Description", ""),
+                            "tag": sel,
+                        }
+                    )
+                form_group_choices.append(
+                    {
+                        "group": group,
+                        "mode": split_choice,
+                        "tag": None,
+                    }
+                )
+
+            submit = st.button("Save tags to Database")
+
+            if submit:
+                any_failed = False
+
+                for group_choice in form_group_choices:
+                    if group_choice["mode"] == "Don't Split":
+                        sel = group_choice["tag"]
+                        if sel == "Select" or sel == "":
+                            any_failed = True
+                            group = group_choice["group"]
+                            st.error(
+                                f"Please select a valid analyst tag for {group['isin']} {group['tran_date']} {group['transaction_desc']}."
+                            )
+                            continue
+
+                        for row in group_choice["group"]["rows"]:
+                            isin = row.get("ISIN", "")
+                            tran_date_str = row.get("Tran Date", "")
+                            security = row.get("Security", "")
+                            client_ucc = row.get("Client UCC", "")
+                            quantity_str = row.get("Quantity", "")
+                            transaction_desc = row.get("Transaction Description", "")
+
+                            date_iso = parse_date_to_iso(tran_date_str)
+                            try:
+                                quantity_value = int(parse_amount_series(pd.Series([quantity_str])).iloc[0])
+                            except Exception:
+                                quantity_value = 0
+
+                            try:
+                                insert_tagging_to_supabase(
+                                    supabase_url,
+                                    supabase_key,
+                                    table_name,
+                                    isin,
+                                    date_iso,
+                                    transaction_desc,
+                                    security,
+                                    client_ucc,
+                                    quantity_value,
+                                    sel,
+                                )
+                                mask = (
+                                    result_df["ISIN"].astype(str).str.strip().str.upper() == str(isin).strip().upper()
+                                ) & (
+                                    result_df["Tran Date"].astype(str).str.strip() == str(tran_date_str).strip()
+                                ) & (
+                                    result_df["Transaction Description"].astype(str).str.strip().str.upper() == str(transaction_desc).strip().upper()
+                                ) & (
+                                    result_df["UCC"].astype(str).str.strip().str.upper() == str(client_ucc).strip().upper()
+                                ) & (
+                                    parse_amount_series(result_df["Quantity"]).abs() == abs(quantity_value)
+                                )
+                                result_df.loc[mask, "Transaction Tagging"] = sel
+                            except Exception as exc:
+                                any_failed = True
+                                st.error(
+                                    f"Failed to save tag for {isin} {tran_date_str} {transaction_desc} (Client: {client_ucc}, Quantity: {quantity_str}): {exc}"
+                                )
+
+                for row_selection in row_selections:
+                    sel = row_selection["tag"]
+                    if sel == "Select" or sel == "":
+                        any_failed = True
+                        st.error(
+                            f"Please select a valid analyst tag for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}, Quantity: {row_selection['quantity']})."
+                        )
+                        continue
+
+                    date_iso = parse_date_to_iso(row_selection["tran_date"])
+                    try:
+                        quantity_value = int(parse_amount_series(pd.Series([row_selection["quantity"]])).iloc[0])
+                    except Exception:
+                        quantity_value = 0
+
+                    try:
+                        insert_tagging_to_supabase(
+                            supabase_url,
+                            supabase_key,
+                            table_name,
+                            row_selection["isin"],
+                            date_iso,
+                            row_selection["transaction_desc"],
+                            row_selection["security"],
+                            row_selection["client_ucc"],
+                            quantity_value,
+                            sel,
+                        )
+                        mask = (
+                            result_df["ISIN"].astype(str).str.strip().str.upper() == str(row_selection["isin"]).strip().upper()
+                        ) & (
+                            result_df["Tran Date"].astype(str).str.strip() == str(row_selection["tran_date"]).strip()
+                        ) & (
+                            result_df["Transaction Description"].astype(str).str.strip().str.upper() == str(row_selection["transaction_desc"]).strip().upper()
+                        ) & (
+                            result_df["UCC"].astype(str).str.strip().str.upper() == str(row_selection["client_ucc"]).strip().upper()
+                        ) & (
+                            parse_amount_series(result_df["Quantity"]).abs() == abs(quantity_value)
+                        )
+                        result_df.loc[mask, "Transaction Tagging"] = sel
+                    except Exception as exc:
+                        any_failed = True
+                        st.error(
+                            f"Failed to save tag for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}, Quantity: {row_selection['quantity']}): {exc}"
+                        )
+
+                if not any_failed:
+                    st.session_state["tags_saved"] = True
+                    st.success("All tags saved to Supabase and report updated. Processing will continue now.")
+                    try:
+                        tagging_raw = fetch_tagging_from_supabase(supabase_url, supabase_key, table_name)
+                        tagging_raw = tagging_raw.astype(str).fillna("")
+                        tagging_raw.columns = tagging_raw.columns.astype(str).str.strip()
+                    except Exception:
+                        pass
+                    st.rerun()
+
+                # If tags haven't been saved yet, stop further processing until user saves them
+                if not st.session_state.get("tags_saved", False):
+                    st.info("Please save tags to Database to continue processing.")
+                    st.stop()
+
+
+    # Prevent downstream processing if there are pending tags that haven't been saved
+    if 'missing_df' in locals() and (not missing_df.empty) and (not st.session_state.get("tags_saved", False)):
+        st.info("Pending tags detected. Please save tags to Database to continue processing.")
+        st.stop()
 
     try:
         isin_symbol_map = load_isin_symbol_map()
@@ -808,6 +1899,7 @@ def main() -> None:
 
     if fetch_live_prices and refresh_live_prices:
         get_current_prices.clear()
+        get_current_and_previous_prices.clear()
         st.info("Refreshing Yahoo prices and recalculating reports.")
 
     if fetch_live_prices:
@@ -817,8 +1909,18 @@ def main() -> None:
                 isin_symbol_map,
                 fetch_live_prices=True,
             )
+            consolidated_sheets = build_consolidated_summaries(
+                result_df,
+                isin_symbol_map,
+                fetch_live_prices=True,
+            )
     else:
         portfolio_df, price_warnings_df, price_fetch_timestamp = build_portfolio_summary(
+            result_df,
+            isin_symbol_map,
+            fetch_live_prices=False,
+        )
+        consolidated_sheets = build_consolidated_summaries(
             result_df,
             isin_symbol_map,
             fetch_live_prices=False,
@@ -835,22 +1937,43 @@ def main() -> None:
     )
 
     with st.container():
-        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-        metric_col1.metric("Raw rows", total_rows)
-        metric_col2.metric("Parsed records", valid_rows)
-        metric_col3.metric("Tagged records", tagged_rows)
-        metric_col4.metric("Skipped rows", skipped_rows)
+        st.markdown(
+            f"""
+            <div class='section-card'>
+                <div class='section-header'><span class='sh-icon'>📋</span> Report summary</div>
+                <div class='metrics-row'>
+                    <div class='metric-card mc-blue'>
+                        <div class='mc-label'>Raw rows</div>
+                        <div class='mc-value'>{total_rows:,}</div>
+                    </div>
+                    <div class='metric-card mc-teal'>
+                        <div class='mc-label'>Parsed records</div>
+                        <div class='mc-value'>{valid_rows:,}</div>
+                    </div>
+                    <div class='metric-card mc-violet'>
+                        <div class='mc-label'>Tagged records</div>
+                        <div class='mc-value'>{tagged_rows:,}</div>
+                    </div>
+                    <div class='metric-card mc-rose'>
+                        <div class='mc-label'>Skipped rows</div>
+                        <div class='mc-value'>{skipped_rows:,}</div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.markdown("---")
 
     with st.container():
-        st.subheader("Parsed report preview")
+        st.markdown("<div class='section-card'><div class='section-header'><span class='sh-icon'>📄</span> Parsed report preview</div>", unsafe_allow_html=True)
         st.markdown("<div class='dataframe-container'>", unsafe_allow_html=True)
         st.dataframe(result_df)
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div></div>", unsafe_allow_html=True)
 
     with st.container():
-        st.subheader("Portfolio derived calculations")
+        st.markdown("<div class='section-card'><div class='section-header'><span class='sh-icon'>💼</span> Portfolio derived calculations</div>", unsafe_allow_html=True)
         if fetch_live_prices:
             st.caption(f"Last price fetched at: {price_fetch_timestamp}")
         else:
@@ -860,7 +1983,15 @@ def main() -> None:
         st.markdown("</div>", unsafe_allow_html=True)
 
     with st.container():
-        st.subheader("Price warnings")
+        st.markdown("<div class='section-card'><div class='section-header'><span class='sh-icon'>📊</span> Consolidated PMS views</div>", unsafe_allow_html=True)
+        for sheet_name, sheet_df in consolidated_sheets.items():
+            with st.expander(sheet_name, expanded=False):
+                st.markdown("<div class='dataframe-container'>", unsafe_allow_html=True)
+                st.dataframe(sheet_df)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.container():
+        st.markdown("<div class='section-card'><div class='section-header'><span class='sh-icon'>⚡</span> Price warnings</div>", unsafe_allow_html=True)
         if price_warnings_df.empty:
             st.info("No unmapped ISINs or missing Yahoo prices found.")
         else:
@@ -870,7 +2001,7 @@ def main() -> None:
             st.markdown("</div>", unsafe_allow_html=True)
 
     with st.container():
-        st.subheader("Skipped rows")
+        st.markdown("<div class='section-card'><div class='section-header'><span class='sh-icon'>🚫</span> Skipped rows</div>", unsafe_allow_html=True)
         if skipped_df.empty:
             st.info("No skipped rows.")
         else:
@@ -881,16 +2012,21 @@ def main() -> None:
     output_csv = dataframe_to_csv_bytes(result_df)
     portfolio_csv = dataframe_to_csv_bytes(portfolio_df)
     skipped_csv = dataframe_to_csv_bytes(skipped_df)
+    consolidated_excel = dataframes_to_excel_bytes(consolidated_sheets)
     all_results_excel = dataframes_to_excel_bytes({
         "Parsed Report": result_df,
         "Portfolio Calculations": portfolio_df,
+        **consolidated_sheets,
         "Price Warnings": price_warnings_df,
         "Skipped Rows": skipped_df,
     })
 
     st.markdown("---")
-    st.subheader("Download results")
-    download_col1, download_col2, download_col3, download_col4 = st.columns(4)
+    st.markdown(
+        "<div class='section-card download-section'><div class='section-header'><span class='sh-icon'>⬇️</span> Download results</div>",
+        unsafe_allow_html=True,
+    )
+    download_col1, download_col2, download_col3, download_col4, download_col5 = st.columns(5)
     with download_col1:
         st.download_button(
             "Download parsed report",
@@ -914,11 +2050,23 @@ def main() -> None:
         )
     with download_col4:
         st.download_button(
+            "Download consolidated sheets",
+            data=consolidated_excel,
+            file_name="PMS_Consolidated_Sheets.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    with download_col5:
+        st.download_button(
             "Download Excel workbook",
             data=all_results_excel,
             file_name="Monarch_Reports.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+    st.markdown(
+        "<div class='app-footer'>Monarch PMS · Transaction Report Generator</div>",
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
