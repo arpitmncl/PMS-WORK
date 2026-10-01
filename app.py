@@ -1,5 +1,7 @@
 #### Changes from app6.py : New Logic For Client Wise Split in Case of Same Analyst, Same Stock, Same Date
 #### Changes from app7.py : Formatting of Page, Colors, Background (Frontend Changes)
+#### Changes from app8.py : Further one more layer of split quantities in same client for different analysts, same stock, same date
+#### Changes from app10.py : Nuvama Input File Format Changed
 
 
 import io
@@ -109,6 +111,37 @@ def parse_monarch_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
                 i += 1
                 continue
 
+            required_transaction_columns = [
+                "Transaction Description",
+                "Tran Date",
+                "Settlement Date",
+                "Security",
+                "ISIN",
+                "Quantity",
+                "Rate",
+                "Brokerage",
+                "STT",
+                "Tran Amount",
+                "Transaction Rate",
+                "Orignal Pur Date",
+            ]
+            header_indexes = {
+                str(raw.iloc[header_row, column]).strip(): column
+                for column in range(raw.shape[1])
+                if str(raw.iloc[header_row, column]).strip()
+            }
+            missing_columns = [
+                column for column in required_transaction_columns
+                if column not in header_indexes
+            ]
+            if missing_columns:
+                skipped_rows.append({
+                    "Row": header_row,
+                    "Reason": f"Transaction Header missing columns: {', '.join(missing_columns)}",
+                })
+                i = header_row + 1
+                continue
+
             for k in range(header_row, min(header_row + 15, n)):
                 value = str(raw.iloc[k, 0]).strip()
                 if value.startswith("Shares - "):
@@ -133,35 +166,39 @@ def parse_monarch_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
                     j += 1
                     continue
 
-                if len(row) < 12:
-                    skipped_rows.append({"Row": j, "Reason": "Less than 12 columns"})
+                if any(header_indexes[column] >= len(row) for column in required_transaction_columns):
+                    skipped_rows.append({"Row": j, "Reason": "Transaction row has fewer columns than its header"})
                     j += 1
                     continue
 
-                transaction_desc = str(row[0]).strip().upper()
+                transaction_values = {
+                    column: str(row.iloc[header_indexes[column]]).strip()
+                    for column in required_transaction_columns
+                }
+                transaction_desc = transaction_values["Transaction Description"].upper()
                 if transaction_desc not in VALID_TRANSACTION_TYPES:
                     j += 1
                     continue
 
-                quantity = str(row[5]).strip()
+                quantity = transaction_values["Quantity"]
                 if transaction_desc == "SELL" and quantity:
                     quantity = f"-{quantity.lstrip('-')}"
 
                 records.append({
                     "Acc number": acc_number,
                     "UCC": ucc,
-                    "Transaction Description": str(row[0]).strip(),
-                    "Tran Date": str(row[1]).strip(),
-                    "Settlement Date": str(row[2]).strip(),
-                    "Security": str(row[3]).strip(),
-                    "ISIN": str(row[4]).strip(),
+                    "Transaction Description": transaction_values["Transaction Description"],
+                    "Tran Date": transaction_values["Tran Date"],
+                    "Settlement Date": transaction_values["Settlement Date"],
+                    "Security": transaction_values["Security"],
+                    "ISIN": transaction_values["ISIN"],
                     "Quantity": quantity,
-                    "Rate": str(row[6]).strip(),
-                    "Brokerage": str(row[7]).strip(),
-                    "STT": str(row[8]).strip(),
-                    "Tran Amount": str(row[9]).strip(),
-                    "Transaction Rate": str(row[10]).strip(),
-                    "Orignal Pur Date": str(row[11]).strip(),
+                    "Rate": transaction_values["Rate"],
+                    "Brokerage": transaction_values["Brokerage"],
+                    "STT": transaction_values["STT"],
+                    "Tran Amount": transaction_values["Tran Amount"],
+                    "Transaction Rate": transaction_values["Transaction Rate"],
+                    "Orignal Pur Date": transaction_values["Orignal Pur Date"],
                     "Transaction Tagging": ""
                 })
 
@@ -179,7 +216,12 @@ def parse_monarch_transactions(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Data
         if df[col].dtype == "object" or pd.api.types.is_string_dtype(df[col]):
             df[col] = df[col].astype(str).str.strip()
 
-    df["Tran Date"] = pd.to_datetime(df["Tran Date"], format="%d-%m-%Y", errors="coerce")
+    normalized_tran_dates = df["Tran Date"].str.replace("/", "-", regex=False)
+    df["Tran Date"] = pd.to_datetime(
+        normalized_tran_dates,
+        format="%d-%m-%Y",
+        errors="coerce",
+    )
 
     required_columns = ["Tran Date", "UCC", "Security", "Quantity"]
     df = df.dropna(subset=required_columns)
@@ -233,8 +275,76 @@ def _normalize_tagging_dataframe(tagging_raw: pd.DataFrame) -> pd.DataFrame:
     return tagging_df
 
 
+def _expand_transactions_for_client_split(result_df: pd.DataFrame, tagging_df: pd.DataFrame) -> pd.DataFrame:
+    if result_df.empty or tagging_df.empty:
+        return result_df.copy()
+
+    normalized = result_df.copy()
+    normalized["Tran Date"] = normalized["Tran Date"].astype(str).str.strip()
+    normalized["Tag Match ISIN"] = normalized["ISIN"].astype(str).str.strip().str.upper()
+    normalized["Tag Match Transaction Description"] = (
+        normalized["Transaction Description"].astype(str).str.strip().str.upper()
+    )
+    normalized["Tag Match Client UCC"] = normalized["UCC"].astype(str).str.strip().str.upper()
+    normalized["Quantity Numeric"] = parse_amount_series(normalized["Quantity"])
+    normalized["Tag Match Quantity Abs"] = normalized["Quantity Numeric"].abs()
+
+    grouping_stats = (
+        tagging_df.groupby(
+            ["Tran Date", "ISIN", "Transaction Description", "Client UCC"],
+            dropna=False,
+        )
+        .agg(
+            TaggedQuantitySum=("Quantity Abs", "sum"),
+            TagEntryCount=("Tag Key", "count"),
+        )
+        .reset_index()
+    )
+
+    merged = normalized.merge(
+        grouping_stats,
+        left_on=["Tran Date", "Tag Match ISIN", "Tag Match Transaction Description", "Tag Match Client UCC"],
+        right_on=["Tran Date", "ISIN", "Transaction Description", "Client UCC"],
+        how="left",
+        suffixes=("", "_taggroup"),
+    )
+
+    if merged["TagEntryCount"].fillna(0).astype(int).sum() == 0:
+        return result_df.copy()
+
+    expand_mask = (
+        (merged["TagEntryCount"].fillna(0).astype(int) > 1)
+        & (merged["TaggedQuantitySum"].fillna(0) == merged["Tag Match Quantity Abs"])
+    )
+
+    original_columns = result_df.columns.tolist()
+    normal_rows = merged.loc[~expand_mask, original_columns].copy()
+    rows_to_expand = merged.loc[expand_mask].copy()
+    if rows_to_expand.empty:
+        return result_df.copy()
+
+    rows_to_expand = rows_to_expand.merge(
+        tagging_df[["Tran Date", "ISIN", "Transaction Description", "Client UCC", "Quantity Abs", "Tag Key"]],
+        left_on=["Tran Date", "Tag Match ISIN", "Tag Match Transaction Description", "Tag Match Client UCC"],
+        right_on=["Tran Date", "ISIN", "Transaction Description", "Client UCC"],
+        how="left",
+        suffixes=("", "_tag"),
+    )
+
+    def _row_quantity_with_sign(row):
+        sign = 1 if row["Quantity Numeric"] >= 0 else -1
+        return str(int(row["Quantity Abs"] * sign))
+
+    rows_to_expand["Quantity"] = rows_to_expand.apply(_row_quantity_with_sign, axis=1)
+    rows_to_expand["Transaction Tagging"] = rows_to_expand["Tag Key"].fillna("")
+    expanded_rows = rows_to_expand[original_columns].copy()
+
+    return pd.concat([normal_rows, expanded_rows], ignore_index=True, sort=False)
+
+
 def add_transaction_tagging(result_df: pd.DataFrame, tagging_raw: pd.DataFrame) -> pd.DataFrame:
     tagging_df = _normalize_tagging_dataframe(tagging_raw)
+    result_df = _expand_transactions_for_client_split(result_df, tagging_df)
 
     tagged_result = result_df.copy()
     tagged_result["Tag Match ISIN"] = tagged_result["ISIN"].astype(str).str.strip().str.upper()
@@ -1726,7 +1836,7 @@ def main() -> None:
                 header_cols[2].markdown("**Security**")
                 header_cols[3].markdown("**Client UCC**")
                 header_cols[4].markdown("**Quantity**")
-                header_cols[5].markdown("**Tag**")
+                header_cols[5].markdown("**Tag / Split**")
 
                 for row_idx, row in enumerate(group["rows"]):
                     cols = st.columns([2, 2, 2, 2, 2, 2], vertical_alignment="center")
@@ -1735,25 +1845,97 @@ def main() -> None:
                     cols[2].write(row.get("Security", ""))
                     cols[3].write(row.get("Client UCC", ""))
                     cols[4].write(row.get("Quantity", ""))
-                    sel = cols[5].selectbox(
-                        f"Tag for {row.get('Client UCC', '')}",
-                        options=["Select"] + sorted(VALID_TRANSACTION_TAGS),
-                        index=0,
-                        key=f"tag_select_{group['group_idx']}_{row_idx}",
-                        label_visibility="visible",
+
+                    split_client = cols[5].checkbox(
+                        "Split this client",
+                        key=f"split_client_{group['group_idx']}_{row_idx}",
+                        help="Split this client's transaction quantity across multiple analysts.",
                     )
-                    row_selections.append(
-                        {
-                            "group": group,
-                            "isin": row.get("ISIN", ""),
-                            "tran_date": row.get("Tran Date", ""),
-                            "security": row.get("Security", ""),
-                            "client_ucc": row.get("Client UCC", ""),
-                            "quantity": row.get("Quantity", ""),
-                            "transaction_desc": row.get("Transaction Description", ""),
-                            "tag": sel,
-                        }
-                    )
+
+                    if split_client:
+                        nested_rows = []
+                        split_count = st.number_input(
+                            "Number of analyst allocations",
+                            min_value=2,
+                            max_value=5,
+                            value=2,
+                            step=1,
+                            key=f"split_count_{group['group_idx']}_{row_idx}",
+                            label_visibility="collapsed",
+                        )
+                        total_quantity = int(abs(parse_amount_series(pd.Series([row.get("Quantity", "")])).iloc[0]))
+                        st.markdown(f"*Split total quantity: **{total_quantity}**. Allocated quantities must sum to this amount.*")
+
+                        for split_idx in range(int(split_count)):
+                            nested_cols = st.columns([2, 2, 2, 2, 2, 2], vertical_alignment="center")
+                            nested_cols[0].write("")
+                            nested_cols[1].write("")
+                            nested_cols[2].write("")
+                            nested_cols[3].write(row.get("Client UCC", ""))
+                            nested_qty = nested_cols[4].number_input(
+                                "Qty",
+                                min_value=0,
+                                value=0,
+                                step=1,
+                                key=f"split_qty_{group['group_idx']}_{row_idx}_{split_idx}",
+                                label_visibility="collapsed",
+                            )
+                            nested_tag = nested_cols[5].selectbox(
+                                "Analyst tag",
+                                options=["Select"] + sorted(VALID_TRANSACTION_TAGS),
+                                index=0,
+                                key=f"split_tag_{group['group_idx']}_{row_idx}_{split_idx}",
+                                label_visibility="collapsed",
+                            )
+                            nested_rows.append(
+                                {
+                                    "quantity": nested_qty,
+                                    "tag": nested_tag,
+                                }
+                            )
+
+                        allocated_sum = sum(int(alloc["quantity"]) for alloc in nested_rows)
+                        if allocated_sum != total_quantity:
+                            cols[5].warning(
+                                f"Split quantities must sum to {total_quantity}. Current allocation: {allocated_sum}."
+                            )
+
+                        row_selections.append(
+                            {
+                                "group": group,
+                                "isin": row.get("ISIN", ""),
+                                "tran_date": row.get("Tran Date", ""),
+                                "security": row.get("Security", ""),
+                                "client_ucc": row.get("Client UCC", ""),
+                                "quantity": row.get("Quantity", ""),
+                                "transaction_desc": row.get("Transaction Description", ""),
+                                "tag": None,
+                                "split_client": True,
+                                "split_allocations": nested_rows,
+                            }
+                        )
+                    else:
+                        sel = cols[5].selectbox(
+                            f"Tag for {row.get('Client UCC', '')}",
+                            options=["Select"] + sorted(VALID_TRANSACTION_TAGS),
+                            index=0,
+                            key=f"tag_select_{group['group_idx']}_{row_idx}",
+                            label_visibility="visible",
+                        )
+                        row_selections.append(
+                            {
+                                "group": group,
+                                "isin": row.get("ISIN", ""),
+                                "tran_date": row.get("Tran Date", ""),
+                                "security": row.get("Security", ""),
+                                "client_ucc": row.get("Client UCC", ""),
+                                "quantity": row.get("Quantity", ""),
+                                "transaction_desc": row.get("Transaction Description", ""),
+                                "tag": sel,
+                                "split_client": False,
+                                "split_allocations": [],
+                            }
+                        )
                 form_group_choices.append(
                     {
                         "group": group,
@@ -1824,50 +2006,96 @@ def main() -> None:
                                 )
 
                 for row_selection in row_selections:
-                    sel = row_selection["tag"]
-                    if sel == "Select" or sel == "":
-                        any_failed = True
-                        st.error(
-                            f"Please select a valid analyst tag for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}, Quantity: {row_selection['quantity']})."
-                        )
-                        continue
+                    if row_selection["split_client"]:
+                        total_quantity = int(abs(parse_amount_series(pd.Series([row_selection["quantity"]])).iloc[0]))
+                        allocated_sum = sum(int(alloc["quantity"]) for alloc in row_selection["split_allocations"])
 
-                    date_iso = parse_date_to_iso(row_selection["tran_date"])
-                    try:
-                        quantity_value = int(parse_amount_series(pd.Series([row_selection["quantity"]])).iloc[0])
-                    except Exception:
-                        quantity_value = 0
+                        if allocated_sum != total_quantity:
+                            any_failed = True
+                            st.error(
+                                f"Split quantities for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}) must sum to {total_quantity}. Currently {allocated_sum}."
+                            )
+                            continue
 
-                    try:
-                        insert_tagging_to_supabase(
-                            supabase_url,
-                            supabase_key,
-                            table_name,
-                            row_selection["isin"],
-                            date_iso,
-                            row_selection["transaction_desc"],
-                            row_selection["security"],
-                            row_selection["client_ucc"],
-                            quantity_value,
-                            sel,
-                        )
-                        mask = (
-                            result_df["ISIN"].astype(str).str.strip().str.upper() == str(row_selection["isin"]).strip().upper()
-                        ) & (
-                            result_df["Tran Date"].astype(str).str.strip() == str(row_selection["tran_date"]).strip()
-                        ) & (
-                            result_df["Transaction Description"].astype(str).str.strip().str.upper() == str(row_selection["transaction_desc"]).strip().upper()
-                        ) & (
-                            result_df["UCC"].astype(str).str.strip().str.upper() == str(row_selection["client_ucc"]).strip().upper()
-                        ) & (
-                            parse_amount_series(result_df["Quantity"]).abs() == abs(quantity_value)
-                        )
-                        result_df.loc[mask, "Transaction Tagging"] = sel
-                    except Exception as exc:
-                        any_failed = True
-                        st.error(
-                            f"Failed to save tag for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}, Quantity: {row_selection['quantity']}): {exc}"
-                        )
+                        for alloc in row_selection["split_allocations"]:
+                            tag = alloc["tag"]
+                            if tag == "Select" or tag == "":
+                                any_failed = True
+                                st.error(
+                                    f"Please select a valid analyst tag for split allocation of {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']})."
+                                )
+                                continue
+
+                            try:
+                                base_qty = int(parse_amount_series(pd.Series([row_selection["quantity"]])).iloc[0])
+                                signed_qty = int(alloc["quantity"]) if base_qty >= 0 else -int(alloc["quantity"])
+                            except Exception:
+                                signed_qty = 0
+
+                            date_iso = parse_date_to_iso(row_selection["tran_date"])
+                            try:
+                                insert_tagging_to_supabase(
+                                    supabase_url,
+                                    supabase_key,
+                                    table_name,
+                                    row_selection["isin"],
+                                    date_iso,
+                                    row_selection["transaction_desc"],
+                                    row_selection["security"],
+                                    row_selection["client_ucc"],
+                                    signed_qty,
+                                    tag,
+                                )
+                            except Exception as exc:
+                                any_failed = True
+                                st.error(
+                                    f"Failed to save split tag for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}, Qty: {alloc['quantity']}): {exc}"
+                                )
+                    else:
+                        sel = row_selection["tag"]
+                        if sel == "Select" or sel == "":
+                            any_failed = True
+                            st.error(
+                                f"Please select a valid analyst tag for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}, Quantity: {row_selection['quantity']})."
+                            )
+                            continue
+
+                        date_iso = parse_date_to_iso(row_selection["tran_date"])
+                        try:
+                            quantity_value = int(parse_amount_series(pd.Series([row_selection["quantity"]])).iloc[0])
+                        except Exception:
+                            quantity_value = 0
+
+                        try:
+                            insert_tagging_to_supabase(
+                                supabase_url,
+                                supabase_key,
+                                table_name,
+                                row_selection["isin"],
+                                date_iso,
+                                row_selection["transaction_desc"],
+                                row_selection["security"],
+                                row_selection["client_ucc"],
+                                quantity_value,
+                                sel,
+                            )
+                            mask = (
+                                result_df["ISIN"].astype(str).str.strip().str.upper() == str(row_selection["isin"]).strip().upper()
+                            ) & (
+                                result_df["Tran Date"].astype(str).str.strip() == str(row_selection["tran_date"]).strip()
+                            ) & (
+                                result_df["Transaction Description"].astype(str).str.strip().str.upper() == str(row_selection["transaction_desc"]).strip().upper()
+                            ) & (
+                                result_df["UCC"].astype(str).str.strip().str.upper() == str(row_selection["client_ucc"]).strip().upper()
+                            ) & (
+                                parse_amount_series(result_df["Quantity"]).abs() == abs(quantity_value)
+                            )
+                            result_df.loc[mask, "Transaction Tagging"] = sel
+                        except Exception as exc:
+                            any_failed = True
+                            st.error(
+                                f"Failed to save tag for {row_selection['isin']} {row_selection['tran_date']} {row_selection['transaction_desc']} (Client: {row_selection['client_ucc']}, Quantity: {row_selection['quantity']}): {exc}"
+                            )
 
                 if not any_failed:
                     st.session_state["tags_saved"] = True
