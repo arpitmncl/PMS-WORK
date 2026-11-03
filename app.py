@@ -25,7 +25,7 @@ import streamlit as st
 import yfinance as yf
 # from dotenv import load_dotenv
 
-# load_dotenv(Path(__file__).with_name(".env"))
+load_dotenv(Path(__file__).with_name(".env"))
 
 VALID_TRANSACTION_TYPES = {"BUY", "SELL"}
 VALID_TRANSACTION_TAGS = {"Dhruv", "Shaukat", "Gaurav"}
