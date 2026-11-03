@@ -1942,9 +1942,9 @@ def main() -> None:
         return df
 
     env = read_env_file(os.path.join(os.getcwd(), ".env"))
-    supabase_url = env.get("SUPABASE_URL")
-    supabase_key = env.get("SUPABASE_KEY")
-    table_name = env.get("TABLE_NAME_2")
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+    table_name = os.getenv("TABLE_NAME_2")
 
     try:
         raw = pd.read_csv(
