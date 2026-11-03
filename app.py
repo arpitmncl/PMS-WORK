@@ -1,21 +1,31 @@
 #### Changes from app6.py : New Logic For Client Wise Split in Case of Same Analyst, Same Stock, Same Date
 #### Changes from app7.py : Formatting of Page, Colors, Background (Frontend Changes)
 #### Changes from app8.py : Further one more layer of split quantities in same client for different analysts, same stock, same date
-#### Changes from app10.py : Nuvama Input File Format Changed
+#### Changes from app9.py : Nuvama Input File Format Changed
+#### Changes from app10.py : Adding Email Alert Option to Share Reports
 
 
 import io
 import re
+import smtplib
+import ssl
 from datetime import datetime
+from email.message import EmailMessage
+from pathlib import Path
 from typing import Dict, Tuple
 
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import requests
 import urllib.parse
 import os
 import streamlit as st
 import yfinance as yf
+from dotenv import load_dotenv
 
+load_dotenv(Path(__file__).with_name(".env"))
 
 VALID_TRANSACTION_TYPES = {"BUY", "SELL"}
 VALID_TRANSACTION_TAGS = {"Dhruv", "Shaukat", "Gaurav"}
@@ -508,10 +518,308 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
 
 def dataframes_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet_name, df in sheets.items():
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    wb = openpyxl.Workbook()
+    # remove default empty sheet
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    # Styles matching Monarch Wealth Creator Fund Portfolio Monitor PDF
+    navy_banner_fill = PatternFill(start_color="0B2545", end_color="0B2545", fill_type="solid")
+    banner_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+
+    header_navy_fill = PatternFill(start_color="0B2545", end_color="0B2545", fill_type="solid")
+    header_teal_fill = PatternFill(start_color="0F4C5C", end_color="0F4C5C", fill_type="solid")
+    header_font = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+
+    zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    total_fill = PatternFill(start_color="E9ECEF", end_color="E9ECEF", fill_type="solid")
+    total_font = Font(name="Calibri", size=10, bold=True, color="0F172A")
+
+    profit_fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+    profit_font = Font(name="Calibri", size=10, bold=True, color="1B5E20")
+    loss_fill = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")
+    loss_font = Font(name="Calibri", size=10, bold=True, color="B71C1C")
+
+    thin_border_side = Side(border_style="thin", color="D0D7DE")
+    data_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+
+    total_top_border = Side(border_style="thin", color="64748B")
+    total_bottom_border = Side(border_style="double", color="0F172A")
+    total_cell_border = Border(left=thin_border_side, right=thin_border_side, top=total_top_border, bottom=total_bottom_border)
+
+    num_fmt_currency = '₹ #,##0.00;[Red]₹ -#,##0.00;"-"'
+    num_fmt_quantity = '#,##0;(#,##0);"-";@'
+
+    for sheet_name, df in sheets.items():
+        ws = wb.create_sheet(title=sheet_name[:31])
+        ws.views.sheetView[0].showGridLines = True
+
+        if df.empty:
+            ws.cell(row=1, column=1, value=f"{sheet_name}: No data available").font = Font(name="Calibri", size=11, bold=True)
+            continue
+
+        columns = list(df.columns)
+        num_cols = len(columns)
+
+        # 1. Determine sheet type
+        is_summary_sheet = any("Company [Total Holdings" in c for c in columns) or sheet_name in ["PMS Consolidated", "Dhruv", "Shaukat", "Gaurav"]
+        is_portfolio_calc = sheet_name == "Portfolio Calculations"
+        is_transaction_sheet = "Transaction Description" in columns or sheet_name == "Parsed Report"
+
+        # 2. Build Banner text (Row 1)
+        ws.row_dimensions[1].height = 28
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=num_cols)
+        banner_cell = ws.cell(row=1, column=1)
+        banner_cell.fill = navy_banner_fill
+        banner_cell.font = banner_font
+        banner_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+
+        if is_summary_sheet:
+            tot_mv = pd.to_numeric(df.get("Market Value", 0), errors="coerce").fillna(0).sum()
+            tot_realised = pd.to_numeric(df.get("Realised P&L", 0), errors="coerce").fillna(0).sum()
+            tot_unrealised = pd.to_numeric(df.get("Unrealised P&L", 0), errors="coerce").fillna(0).sum()
+            tot_today = pd.to_numeric(df.get("Today's Change", 0), errors="coerce").fillna(0).sum()
+            banner_text = (
+                f"Current Holding ----->  {len(df)} Companies   |   "
+                f"Market Value: ₹ {tot_mv:,.2f}   |   "
+                f"Today's Change: ₹ {tot_today:,.2f}   |   "
+                f"Realised: ₹ {tot_realised:,.2f}   |   "
+                f"Unrealised: ₹ {tot_unrealised:,.2f}"
+            )
+        elif is_portfolio_calc:
+            tot_mv = pd.to_numeric(df.get("Market Value", 0), errors="coerce").fillna(0).sum()
+            tot_realised = pd.to_numeric(df.get("Realised P&L", 0), errors="coerce").fillna(0).sum()
+            tot_unrealised = pd.to_numeric(df.get("Unrealised P&L", 0), errors="coerce").fillna(0).sum()
+            banner_text = (
+                f"Portfolio Derived Calculations   |   Total Holdings: {len(df)}   |   "
+                f"Market Value: ₹ {tot_mv:,.2f}   |   "
+                f"Realised: ₹ {tot_realised:,.2f}   |   "
+                f"Unrealised: ₹ {tot_unrealised:,.2f}"
+            )
+        elif is_transaction_sheet:
+            banner_text = f"Monarch Transaction Statement   |   Total Records: {len(df)}"
+        else:
+            banner_text = f"Monarch PMS · {sheet_name}   |   Total Records: {len(df)}"
+
+        banner_cell.value = banner_text
+
+        # 3. Headers (Row 2)
+        ws.row_dimensions[2].height = 24
+        header_fill = header_teal_fill if is_summary_sheet else header_navy_fill
+        for col_idx, col_name in enumerate(columns, start=1):
+            cell = ws.cell(row=2, column=col_idx, value=col_name)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = data_border
+            align_h = "left"
+            if col_name in [
+                "Units", "Wt Avg Cost", "Current Price", "Previous Close",
+                "Market Value", "Today's Change", "Realised P&L", "Unrealised P&L",
+                "Rate", "Tran Amount", "Quantity", "Brokerage", "STT", "Transaction Rate"
+            ]:
+                align_h = "right"
+            elif col_name in [
+                "ISIN", "UCC", "Client UCC", "Acc number",
+                "Tran Date", "Settlement Date", "Orignal Pur Date", "Date"
+            ]:
+                align_h = "center"
+            cell.alignment = Alignment(horizontal=align_h, vertical="center", wrap_text=False)
+
+        # 4. Data Rows (Row 3 to len(df) + 2)
+        pnl_col_names = {"Today's Change", "Realised P&L", "Unrealised P&L"}
+        qty_col_names = {"Units", "Quantity"}
+        price_col_names = {"Wt Avg Cost", "Current Price", "Previous Close", "Rate", "Transaction Rate"}
+        amount_col_names = {"Market Value", "Tran Amount", "Brokerage", "STT"}
+
+        for row_idx, row_data in enumerate(df.itertuples(index=False), start=3):
+            ws.row_dimensions[row_idx].height = 20
+            is_odd = (row_idx % 2 == 1)
+            row_fill = zebra_fill if is_odd else None
+
+            for col_idx, (col_name, val) in enumerate(zip(columns, row_data), start=1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.border = data_border
+
+                align_h = "left"
+                if col_name in pnl_col_names or col_name in qty_col_names or col_name in price_col_names or col_name in amount_col_names:
+                    align_h = "right"
+                elif col_name in ["ISIN", "UCC", "Client UCC", "Acc number", "Tran Date", "Settlement Date", "Orignal Pur Date", "Date"]:
+                    align_h = "center"
+
+                cell.alignment = Alignment(horizontal=align_h, vertical="center")
+
+                # Parse numerical values
+                num_val = None
+                if col_name in pnl_col_names or col_name in qty_col_names or col_name in price_col_names or col_name in amount_col_names:
+                    try:
+                        clean_v = str(val).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
+                        num_val = float(clean_v) if clean_v not in ["", "nan", "None"] else None
+                    except (ValueError, TypeError):
+                        num_val = None
+
+                if num_val is not None:
+                    cell.value = num_val
+                    if col_name in pnl_col_names:
+                        cell.number_format = num_fmt_currency
+                        if num_val > 0.001:
+                            cell.fill = profit_fill
+                            cell.font = profit_font
+                        elif num_val < -0.001:
+                            cell.fill = loss_fill
+                            cell.font = loss_font
+                        else:
+                            if row_fill:
+                                cell.fill = row_fill
+                            cell.font = Font(name="Calibri", size=10)
+                    elif col_name in qty_col_names:
+                        cell.number_format = num_fmt_quantity
+                        if row_fill:
+                            cell.fill = row_fill
+                        cell.font = Font(name="Calibri", size=10)
+                    elif col_name in price_col_names or col_name in amount_col_names:
+                        cell.number_format = num_fmt_currency
+                        if row_fill:
+                            cell.fill = row_fill
+                        cell.font = Font(name="Calibri", size=10)
+                else:
+                    cell.value = "" if pd.isna(val) else str(val).strip()
+                    if row_fill:
+                        cell.fill = row_fill
+                    cell.font = Font(name="Calibri", size=10)
+
+        # 5. Summary Total Row (Row len(df) + 3)
+        summary_row_idx = len(df) + 3
+        if is_summary_sheet or is_portfolio_calc:
+            ws.row_dimensions[summary_row_idx].height = 24
+            for col_idx, col_name in enumerate(columns, start=1):
+                c = ws.cell(row=summary_row_idx, column=col_idx)
+                c.fill = total_fill
+                c.border = total_cell_border
+                c.font = total_font
+                c.alignment = Alignment(horizontal="right", vertical="center")
+
+                if col_idx == 1:
+                    c.value = "Total"
+                    c.alignment = Alignment(horizontal="left", vertical="center")
+                elif col_name in qty_col_names:
+                    start_letter = get_column_letter(col_idx)
+                    c.value = f"=SUM({start_letter}3:{start_letter}{summary_row_idx - 1})"
+                    c.number_format = num_fmt_quantity
+                elif col_name in amount_col_names or col_name in pnl_col_names:
+                    start_letter = get_column_letter(col_idx)
+                    c.value = f"=SUM({start_letter}3:{start_letter}{summary_row_idx - 1})"
+                    c.number_format = num_fmt_currency
+                else:
+                    c.value = "-"
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+
+        elif is_transaction_sheet:
+            ws.row_dimensions[summary_row_idx].height = 24
+            for col_idx, col_name in enumerate(columns, start=1):
+                c = ws.cell(row=summary_row_idx, column=col_idx)
+                c.fill = total_fill
+                c.border = total_cell_border
+                c.font = total_font
+                c.alignment = Alignment(horizontal="right", vertical="center")
+                if col_idx == 1:
+                    c.value = "Total"
+                    c.alignment = Alignment(horizontal="left", vertical="center")
+                elif col_name in ["Quantity", "Tran Amount"]:
+                    start_letter = get_column_letter(col_idx)
+                    c.value = f"=SUM({start_letter}3:{start_letter}{summary_row_idx - 1})"
+                    c.number_format = num_fmt_quantity if col_name == "Quantity" else num_fmt_currency
+                else:
+                    c.value = ""
+
+        # 6. Column auto-fit width
+        for col_idx, col_name in enumerate(columns, start=1):
+            col_letter = get_column_letter(col_idx)
+            max_len = len(str(col_name))
+            for r in range(3, min(len(df) + 3, 100)):
+                val_str = str(ws.cell(row=r, column=col_idx).value or "")
+                if len(val_str) > max_len:
+                    max_len = len(val_str)
+            col_width = min(max(max_len + 4, 13), 50)
+            ws.column_dimensions[col_letter].width = col_width
+
+        # 7. Freeze panes below header
+        ws.freeze_panes = "A3"
+
+    wb.save(output)
     return output.getvalue()
+
+
+def send_report_email(workbook_bytes: bytes) -> None:
+    sender_email = os.getenv("EMAIL_SENDER", "").strip()
+    app_password = re.sub(r"\s+", "", os.getenv("EMAIL_APP_PASSWORD", ""))
+    smtp_server = os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com").strip() or "smtp.gmail.com"
+    smtp_port_value = os.getenv("EMAIL_SMTP_PORT", "587").strip()
+    recipients_value = os.getenv("EMAIL_RECIPIENTS", "")
+    recipients = [
+        address.strip()
+        for address in re.split(r"[,;]", recipients_value)
+        if address.strip()
+    ]
+
+    missing_settings = [
+        name for name, value in (
+            ("EMAIL_SENDER", sender_email),
+            ("EMAIL_APP_PASSWORD", app_password),
+            ("EMAIL_RECIPIENTS", recipients),
+        )
+        if not value
+    ]
+    if missing_settings:
+        raise ValueError(
+            "Missing .env setting(s): " + ", ".join(missing_settings)
+        )
+
+    try:
+        smtp_port = int(smtp_port_value)
+    except ValueError as exc:
+        raise ValueError("EMAIL_SMTP_PORT must be a valid port number.") from exc
+
+    message = EmailMessage()
+    message["Subject"] = "Monarch PMS Reports"
+    message["From"] = sender_email
+    message["To"] = ", ".join(recipients)
+    message.set_content("The latest Monarch PMS reports are attached.")
+    message.add_attachment(
+        workbook_bytes,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="Monarch_Reports.xlsx",
+    )
+
+    if smtp_port == 465:
+        smtp_connection = smtplib.SMTP_SSL(
+            smtp_server,
+            smtp_port,
+            timeout=30,
+            context=ssl.create_default_context(),
+        )
+    else:
+        smtp_connection = smtplib.SMTP(smtp_server, smtp_port, timeout=30)
+
+    with smtp_connection as smtp:
+        if smtp_port != 465:
+            smtp.ehlo()
+            smtp.starttls(context=ssl.create_default_context())
+            smtp.ehlo()
+        try:
+            smtp.login(sender_email, app_password)
+        except smtplib.SMTPAuthenticationError as exc:
+            raise smtplib.SMTPAuthenticationError(
+                exc.smtp_code,
+                f"Authentication failed for {sender_email}. Please ensure EMAIL_APP_PASSWORD is an active Google App Password and 2-Step Verification is enabled. ({exc.smtp_error})"
+            ) from exc
+        except smtplib.SMTPServerDisconnected as exc:
+            raise smtplib.SMTPServerDisconnected(
+                "Connection unexpectedly closed by mail server during authentication. "
+                "This typically occurs when Gmail rejects the app password/credentials and immediately terminates the session. "
+                "Please verify EMAIL_SENDER and generate a fresh 16-character App Password."
+            ) from exc
+        smtp.send_message(message)
 
 
 def parse_amount_series(series: pd.Series) -> pd.Series:
@@ -2254,7 +2562,7 @@ def main() -> None:
         "<div class='section-card download-section'><div class='section-header'><span class='sh-icon'>⬇️</span> Download results</div>",
         unsafe_allow_html=True,
     )
-    download_col1, download_col2, download_col3, download_col4, download_col5 = st.columns(5)
+    download_col1, download_col2, download_col3, download_col4, download_col5, email_col = st.columns(6)
     with download_col1:
         st.download_button(
             "Download parsed report",
@@ -2290,6 +2598,24 @@ def main() -> None:
             file_name="Monarch_Reports.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+    with email_col:
+        if st.button("Send Email", key="send_report_email"):
+            try:
+                send_report_email(all_results_excel)
+            except ValueError as exc:
+                st.error(str(exc))
+            except smtplib.SMTPAuthenticationError as exc:
+                st.error(f"Authentication Error: {exc}")
+            except smtplib.SMTPServerDisconnected as exc:
+                st.error(
+                    f"Email could not be sent: {exc} "
+                    "Outbound SMTP network connectivity is working, but the mail server rejected the credentials and terminated the connection. "
+                    "Check EMAIL_SENDER, EMAIL_APP_PASSWORD in .env, and ensure 2FA is active."
+                )
+            except (OSError, smtplib.SMTPException) as exc:
+                st.error(f"Email could not be sent: {exc}")
+            else:
+                st.success("Report workbook sent successfully.")
 
     st.markdown(
         "<div class='app-footer'>Monarch PMS · Transaction Report Generator</div>",
