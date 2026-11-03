@@ -23,7 +23,7 @@ import urllib.parse
 import os
 import streamlit as st
 import yfinance as yf
-# from dotenv import load_dotenv
+from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).with_name(".env"))
 
