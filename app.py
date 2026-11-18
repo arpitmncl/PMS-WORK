@@ -3,9 +3,11 @@
 #### Changes from app8.py : Further one more layer of split quantities in same client for different analysts, same stock, same date
 #### Changes from app9.py : Nuvama Input File Format Changed
 #### Changes from app10.py : Adding Email Alert Option to Share Reports
+#### Changes from app11.py : Developer Alert Layer Addition
 
 
 import io
+import logging
 import re
 import smtplib
 import ssl
@@ -749,12 +751,17 @@ def dataframes_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
     return output.getvalue()
 
 
-def send_report_email(workbook_bytes: bytes) -> None:
+def send_report_email(
+    workbook_bytes: bytes,
+    recipients_env: str = "EMAIL_RECIPIENTS",
+    subject: str = "Monarch PMS Reports",
+    body: str = "The latest Monarch PMS reports are attached.",
+) -> None:
     sender_email = os.getenv("EMAIL_SENDER", "").strip()
     app_password = re.sub(r"\s+", "", os.getenv("EMAIL_APP_PASSWORD", ""))
     smtp_server = os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com").strip() or "smtp.gmail.com"
     smtp_port_value = os.getenv("EMAIL_SMTP_PORT", "587").strip()
-    recipients_value = os.getenv("EMAIL_RECIPIENTS", "")
+    recipients_value = os.getenv(recipients_env, "")
     recipients = [
         address.strip()
         for address in re.split(r"[,;]", recipients_value)
@@ -765,7 +772,7 @@ def send_report_email(workbook_bytes: bytes) -> None:
         name for name, value in (
             ("EMAIL_SENDER", sender_email),
             ("EMAIL_APP_PASSWORD", app_password),
-            ("EMAIL_RECIPIENTS", recipients),
+            (recipients_env, recipients),
         )
         if not value
     ]
@@ -2557,6 +2564,16 @@ def main() -> None:
         "Skipped Rows": skipped_df,
     })
 
+    try:
+        send_report_email(
+            all_results_excel,
+            recipients_env="DEVELOPER_EMAIL_RECIPIENTS",
+            subject="Monarch Report - Developer Alert",
+            body="The processed Monarch report workbook is attached.",
+        )
+    except (ValueError, OSError, smtplib.SMTPException):
+        logging.exception("Automatic developer report email could not be sent.")
+        
     st.markdown("---")
     st.markdown(
         "<div class='section-card download-section'><div class='section-header'><span class='sh-icon'>⬇️</span> Download results</div>",
